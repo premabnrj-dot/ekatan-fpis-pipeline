@@ -999,12 +999,28 @@ MAX_ROOM_POLYGON_VERTS = 10
 
 # Words that mean "this polygon is over a room", used to reject detections
 # that landed on a title block or a legend.
+# ⚠️ BUILDERS RENAME ROOMS FOR MARKETING, and this list is what decides whether
+# a detected polygon is over a room at all. Measured on a real Godrej Royale
+# Woods plan (2026-08-28): the model found 9 rooms correctly and **all 9 were
+# thrown away**, because the drawing says SLEEP, LOUNGE, COOK/DINE, SPLASH,
+# CLEANSE and SITOUT rather than bedroom, living, kitchen, bathroom, utility and
+# balcony. Nothing logged a problem — the plan simply fell through to the Claude
+# fallback and looked like the model had failed.
+#
+# Add a builder's vocabulary here the first time one of their plans is seen.
+# The cost of a missing word is silent and total; the cost of an extra one is
+# almost nil, because the agreement table below still has to match the class.
 ROOM_LABEL_WORDS = (
     "BEDROOM", "BED ROOM", "KITCHEN", "LIVING", "HALL", "DINING", "BALCONY",
     "UTILITY", "TOILET", "BATH", "W/C", "WC", "FOYER", "ENTRY", "ENTRANCE",
     "LOBBY", "STUDY", "OFFICE", "POOJA", "PUJA", "STORE", "PASSAGE",
     "CORRIDOR", "TERRACE", "DECK", "MASTER", "GUEST", "PARENT", "SERVANT",
     "MAID", "WALKIN", "WALK-IN", "DRESS", "M.BED", "M. BED",
+    # Godrej Royale Woods, observed 2026-08-28
+    "SLEEP", "LOUNGE", "COOK", "DINE", "SPLASH", "CLEANSE", "SITOUT", "SIT OUT",
+    # other Indian-plan variants seen across the 18-brochure harvest
+    "CHILDREN BED", "COM.TOILET", "COMMON TOILET", "WASH", "SERVICE",
+    "PANTRY", "POWDER", "VERANDAH", "VERANDA", "DRAWING", "FAMILY",
 )
 
 # The printed label must AGREE with the predicted class. This is the gate that
@@ -1012,16 +1028,27 @@ ROOM_LABEL_WORDS = (
 # still wrong - a "living_room" polygon sitting over PARENT'S BEDROOM, a
 # "bathroom" over UTILITY. Confidence could not see it (0.83, 0.95) and neither
 # could area. Only the drawing's own words could.
+# This is the gate that matters: it catches a polygon in the WRONG PLACE — a
+# "living_room" sitting over PARENT'S BEDROOM — which confidence and area cannot
+# see. It is NOT meant to arbitrate fine distinctions between adjacent classes.
+# That is why TERRACE and SITOUT are accepted for utility_balcony below: calling
+# a private terrace a balcony is a small labelling imprecision, while REJECTING
+# it loses the room entirely, and losing rooms is the failure this whole gate
+# stack is trying to avoid.
 YOLO_LABEL_AGREEMENT = {
-    "bedroom":         ("BEDROOM", "BED ROOM", "M.BED", "M. BED", "GUEST", "PARENT", "MASTER"),
+    "bedroom":         ("BEDROOM", "BED ROOM", "M.BED", "M. BED", "GUEST", "PARENT",
+                        "MASTER", "SLEEP", "CHILDREN BED"),
     "master_bedroom":  ("MASTER", "M.BED", "M. BED"),
     "servant_room":    ("SERVANT", "MAID"),
-    "bathroom":        ("TOILET", "BATH", "W/C", "WC"),
-    "kitchen":         ("KITCHEN",),
-    "living_room":     ("LIVING", "HALL", "DRAWING"),
-    "dining_area":     ("DINING",),
-    "utility_balcony": ("BALCONY", "UTILITY", "WASH", "SERVICE"),
-    "terrace":         ("TERRACE", "DECK"),
+    "bathroom":        ("TOILET", "BATH", "W/C", "WC", "SPLASH", "POWDER",
+                        "COM.TOILET", "COMMON TOILET"),
+    "kitchen":         ("KITCHEN", "COOK", "PANTRY"),
+    "living_room":     ("LIVING", "HALL", "DRAWING", "LOUNGE", "FAMILY"),
+    "dining_area":     ("DINING", "DINE"),
+    "utility_balcony": ("BALCONY", "UTILITY", "WASH", "SERVICE", "CLEANSE",
+                        "SITOUT", "SIT OUT", "VERANDAH", "VERANDA", "TERRACE",
+                        "DECK"),
+    "terrace":         ("TERRACE", "DECK", "SITOUT", "SIT OUT"),
     "passage":         ("LOBBY", "PASSAGE", "CORRIDOR"),
     "foyer_entrance":  ("FOYER", "ENTRY", "ENTRANCE"),
     "home_office":     ("STUDY", "OFFICE"),
