@@ -1,3 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ekatan
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option) any
+# later version. It is distributed WITHOUT ANY WARRANTY; see the licence for
+# details: <https://www.gnu.org/licenses/>.
+#
+# ⚠️ THIS FILE IS PUBLIC — https://github.com/premabnrj-dot/ekatan-fpis-pipeline
+# It uses Ultralytics YOLO (AGPL-3.0) and Ekatan serves inference over a network,
+# so section 13 applies and this source is published (ADR-171). Two consequences,
+# both load-bearing:
+#   • NEVER put a secret, credential or customer identifier in this file. Every
+#     secret arrives through modal.Secret / os.environ, and that is a rule now.
+#   • A STALE PUBLIC COPY IS NOT COMPLIANCE. `modal deploy` ships from a working
+#     copy and forces no commit, so deploy and publish in the same motion.
 # =============================================================================
 # FILE: fpis_pipeline.py
 # Ekatan FPIS — Floor Plan Intelligence System
