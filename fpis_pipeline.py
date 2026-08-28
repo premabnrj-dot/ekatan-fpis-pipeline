@@ -155,7 +155,7 @@ model_volume = modal.Volume.from_name("fpis-model-weights", create_if_missing=Tr
 #
 # room_types.code values in DB:
 #   master_bedroom, bedroom, living_room, dining_area, kitchen, bathroom,
-#   pooja_room, home_office, foyer_entrance, utility_balcony,
+#   pooja_room, home_office, foyer_entrance, balcony, utility,
 #   passage, staircase, servant_room, store, terrace, other
 #
 # opening_types.code values in DB:
@@ -164,10 +164,21 @@ model_volume = modal.Volume.from_name("fpis-model-weights", create_if_missing=Tr
 #   arched_opening, niche_shallow, niche_deep,
 #   exhaust_opening, duct_access, pass_through, meter_box
 
+# ⚠️ `utility_balcony` IS NOT A ROOM TYPE. It is a legacy code, dropped in
+# Ekatan migration 0088, and `room-type-normalize.ts` aliases it to `balcony`.
+# Emitting it meant every UTILITY this pipeline found was stored as a BALCONY —
+# and per ADR-133 those are opposites in the only way that matters commercially:
+#
+#     balcony   outdoor · 80 rooms in the DB · 0 L3 systems mapped · sells nothing
+#     utility   indoor work area · 24 rooms · 2 L3 systems · sells storage
+#
+# The resolver's label rescue only ever promotes utility -> balcony, never back,
+# so nothing downstream could undo it. Verified against the live room_types
+# table on 2026-08-28. These two are now separate, and must stay separate.
 VALID_ROOM_CODES = {
     "master_bedroom", "bedroom", "living_room", "dining_area",
     "kitchen", "bathroom", "pooja_room", "home_office",
-    "foyer_entrance", "utility_balcony", "passage", "staircase",
+    "foyer_entrance", "balcony", "utility", "passage", "staircase",
     "servant_room", "store", "terrace", "other",
 }
 
@@ -179,52 +190,18 @@ VALID_OPENING_CODES = {
 }
 
 # Rooms that must always have is_wet_area = true
-WET_AREA_CODES = {"bathroom", "kitchen", "utility_balcony"}
+WET_AREA_CODES = {"bathroom", "kitchen", "utility", "balcony"}
 
 # Rooms exempt from the "zero openings" rule
 NO_OPENING_EXEMPT = {"passage", "staircase", "store"}
 
-# Rooms excluded from carpet area total (external / non-habitable)
-EXTERNAL_ROOM_CODES = {"utility_balcony", "staircase", "terrace"}
-
-# ─── CubiCasa5K class index ↔ DB code mappings ────────────────────────────────
-# Index order MUST match train_raster2seq.py ROOM_CODES list exactly.
-
-NUM_ROOM_CLASSES = 17
-NUM_ICON_CLASSES = 9
-
-ROOM_CLASS_TO_CODE = [
-    "other",           # 0  background → fallback
-    "living_room",     # 1
-    "dining_area",     # 2
-    "kitchen",         # 3
-    "master_bedroom",  # 4
-    "bedroom",         # 5
-    "bathroom",        # 6
-    "pooja_room",      # 7
-    "home_office",     # 8
-    "foyer_entrance",  # 9
-    "utility_balcony", # 10
-    "passage",         # 11
-    "staircase",       # 12
-    "servant_room",    # 13
-    "store",           # 14
-    "terrace",         # 15
-    "other",           # 16
-]
-
-ICON_CLASS_TO_CODE = [
-    None,              # 0  background
-    "single_door",     # 1
-    "double_door",     # 2
-    "sliding_door",    # 3
-    "window_standard", # 4
-    "window_bay",      # 5
-    "ventilator",      # 6
-    "arched_opening",  # 7
-    "single_door",     # 8  other → fallback
-]
-
+# Rooms excluded from carpet area total (external / non-habitable).
+# ⚠️ A UTILITY IS NOT EXTERNAL. It is the indoor work area beside the kitchen
+# (ADR-133), so it belongs in carpet area; only the balcony is outside. While
+# both wore the `utility_balcony` code this list silently excluded every utility
+# from the plan-area check, which is how Rule 8 could pass on a plan whose
+# internal area was understated.
+EXTERNAL_ROOM_CODES = {"balcony", "staircase", "terrace"}
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
@@ -962,7 +939,7 @@ Return JSON array only. If no MEP zones found, return empty array [].
 # bathroom / pooja_room / staircase / servant_room / home_office /
 # foyer_entrance / terrace split, and VALID_ROOM_CODES needs exactly those.
 YOLO_ROOM_TO_CODE = {
-    "0-Balcony":         "utility_balcony",
+    "0-Balcony":         "balcony",
     "2-Bedroom":         "bedroom",
     "12-attachBedroom":  "bedroom",
     "3.Dining Room":     "dining_area",
@@ -975,7 +952,7 @@ YOLO_ROOM_TO_CODE = {
     "22-lobby":          "passage",
     "25-study":          "home_office",
     "26-toilet":         "bathroom",
-    "28-utility":        "utility_balcony",
+    "28-utility":        "utility",
     "29-walkin":         "store",
 }
 
@@ -1031,7 +1008,7 @@ ROOM_LABEL_WORDS = (
 # This is the gate that matters: it catches a polygon in the WRONG PLACE — a
 # "living_room" sitting over PARENT'S BEDROOM — which confidence and area cannot
 # see. It is NOT meant to arbitrate fine distinctions between adjacent classes.
-# That is why TERRACE and SITOUT are accepted for utility_balcony below: calling
+# That is why TERRACE and SITOUT are accepted for `balcony` below: calling
 # a private terrace a balcony is a small labelling imprecision, while REJECTING
 # it loses the room entirely, and losing rooms is the failure this whole gate
 # stack is trying to avoid.
@@ -1045,9 +1022,12 @@ YOLO_LABEL_AGREEMENT = {
     "kitchen":         ("KITCHEN", "COOK", "PANTRY"),
     "living_room":     ("LIVING", "HALL", "DRAWING", "LOUNGE", "FAMILY"),
     "dining_area":     ("DINING", "DINE"),
-    "utility_balcony": ("BALCONY", "UTILITY", "WASH", "SERVICE", "CLEANSE",
-                        "SITOUT", "SIT OUT", "VERANDAH", "VERANDA", "TERRACE",
-                        "DECK"),
+    # Split deliberately — see the note on VALID_ROOM_CODES. A drawing that
+    # says UTILITY must not satisfy a balcony prediction, or the distinction
+    # this split exists to protect is undone one gate later.
+    "balcony":         ("BALCONY", "SITOUT", "SIT OUT", "VERANDAH", "VERANDA",
+                        "TERRACE", "DECK"),
+    "utility":         ("UTILITY", "WASH", "CLEANSE", "SERVICE", "LAUNDRY"),
     "terrace":         ("TERRACE", "DECK", "SITOUT", "SIT OUT"),
     "passage":         ("LOBBY", "PASSAGE", "CORRIDOR"),
     "foyer_entrance":  ("FOYER", "ENTRY", "ENTRANCE"),
@@ -1510,7 +1490,8 @@ Room label guidance:
 - "Pooja", "Puja", "Prayer Room", "Mandir"       → pooja_room
 - "Study", "Office", "Work Room"                 → home_office
 - "Foyer", "Entry", "Entrance", "Lobby"          → foyer_entrance
-- "Balcony", "Utility", "Service", "Wash Area"   → utility_balcony
+- "Balcony", "Sit Out", "Deck", "Terrace"        → balcony
+- "Utility", "Service", "Wash Area", "Cleanse"   → utility
 - "Passage", "Corridor", "Gallery"               → passage
 - "Staircase", "Stair", "Lift"                   → staircase
 - "Servant", "Maid", "Staff"                     → servant_room
