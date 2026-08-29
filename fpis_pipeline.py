@@ -156,7 +156,8 @@ model_volume = modal.Volume.from_name("fpis-model-weights", create_if_missing=Tr
 # room_types.code values in DB:
 #   master_bedroom, bedroom, living_room, dining_area, kitchen, bathroom,
 #   pooja_room, home_office, foyer_entrance, balcony, utility,
-#   passage, staircase, servant_room, store, terrace, other
+#   passage, staircase, servant_room, store, terrace, other,
+#   kids_room, guest_room, home_theatre, powder_room, master_bathroom
 #
 # opening_types.code values in DB:
 #   single_door, double_door, sliding_door, french_door, pocket_door,
@@ -180,6 +181,16 @@ VALID_ROOM_CODES = {
     "kitchen", "bathroom", "pooja_room", "home_office",
     "foyer_entrance", "balcony", "utility", "passage", "staircase",
     "servant_room", "store", "terrace", "other",
+    # These five are reached ONLY by `_refine_room_code`, never by the model.
+    # Each is a bedroom or a bathroom in SHAPE - nothing about the outline tells
+    # them apart, only the printed name does - so they are deliberately NOT
+    # training classes. Measured against the live catalogue on 2026-08-29 they
+    # carry 17 published L3 systems between them and had been detected ZERO
+    # times, because nothing in this pipeline ever emitted the codes:
+    #     kids_room 7 systems - guest_room 4 - home_theatre 2 -
+    #     powder_room 2 - master_bathroom 2
+    # kids_room alone has more published systems than kitchen.
+    "kids_room", "guest_room", "home_theatre", "powder_room", "master_bathroom",
 }
 
 VALID_OPENING_CODES = {
@@ -190,7 +201,8 @@ VALID_OPENING_CODES = {
 }
 
 # Rooms that must always have is_wet_area = true
-WET_AREA_CODES = {"bathroom", "kitchen", "utility", "balcony"}
+WET_AREA_CODES = {"bathroom", "kitchen", "utility", "balcony",
+                  "master_bathroom", "powder_room"}
 
 # Rooms exempt from the "zero openings" rule
 NO_OPENING_EXEMPT = {"passage", "staircase", "store"}
@@ -998,6 +1010,11 @@ ROOM_LABEL_WORDS = (
     # other Indian-plan variants seen across the 18-brochure harvest
     "CHILDREN BED", "COM.TOILET", "COMMON TOILET", "WASH", "SERVICE",
     "PANTRY", "POWDER", "VERANDAH", "VERANDA", "DRAWING", "FAMILY",
+    # Words that reach the five refinement-only codes (see VALID_ROOM_CODES).
+    # Without them the polygon is thrown out one gate EARLIER than the
+    # refinement, so adding the refinement alone would have changed nothing.
+    "KIDS", "KID'S", "CHILDREN", "CHILD", "THEATRE", "THEATER",
+    "CINEMA", "MEDIA", "M.TOILET", "M. TOILET",
 )
 
 # The printed label must AGREE with the predicted class. This is the gate that
@@ -1017,6 +1034,20 @@ YOLO_LABEL_AGREEMENT = {
                         "MASTER", "SLEEP", "CHILDREN BED"),
     "master_bedroom":  ("MASTER", "M.BED", "M. BED"),
     "servant_room":    ("SERVANT", "MAID"),
+    # These five exist because the gate below runs AFTER _refine_room_code and
+    # reads `.get(code, ())`. A refined code missing from this table matches the
+    # empty tuple and the room is DROPPED - so a promotion without an entry here
+    # would LOSE rooms rather than type them better.
+    # They are permissive on purpose: the refinement only fires when the
+    # distinguishing word is already present, so the marker is always found, and
+    # the base words are here so a near-miss keeps the room.
+    "kids_room":       ("KIDS", "KID'S", "CHILDREN", "CHILD",
+                        "BEDROOM", "BED ROOM"),
+    "guest_room":      ("GUEST", "BEDROOM", "BED ROOM"),
+    "home_theatre":    ("THEATRE", "THEATER", "CINEMA", "MEDIA"),
+    "master_bathroom": ("MASTER", "M.TOILET", "M. TOILET", "MASTER TOILET",
+                        "TOILET", "BATH"),
+    "powder_room":     ("POWDER", "TOILET", "BATH", "WC", "W/C"),
     "bathroom":        ("TOILET", "BATH", "W/C", "WC", "SPLASH", "POWDER",
                         "COM.TOILET", "COMMON TOILET"),
     "kitchen":         ("KITCHEN", "COOK", "PANTRY"),
@@ -1116,15 +1147,57 @@ def _rectify_contour(contour, cv2, np):
 
 
 def _refine_room_code(code: str, texts: list[str]) -> str:
-    """The model has no master-bedroom class; the drawing says so in words."""
-    if code != "bedroom":
-        return code
+    """Seven room types the model has no class for; the drawing says so in words.
+
+    A kids room is shaped exactly like a bedroom and a powder room exactly like a
+    bathroom. Nothing about the OUTLINE separates them, so training a class for
+    each would split the examples across shapes the model cannot tell apart and
+    still get them wrong. The printed name is the only real signal, and it is
+    free - so the shape is detected and the words do the sorting.
+
+    Every code returned here MUST be a key in YOLO_LABEL_AGREEMENT. The caller
+    gates on `.get(code, ())` immediately after this returns, so a promotion to a
+    code absent there matches the empty tuple and the room is DROPPED - strictly
+    worse than never promoting. `test_refine_room_code()` asserts that closure.
+
+    Order is most-specific-first within each base type. MASTER is tested before
+    the additions so existing behaviour is unchanged.
+    """
     joined = " ".join(texts).upper()
-    if "MASTER" in joined or "M.BED" in joined or "M. BED" in joined:
-        return "master_bedroom"
-    if "SERVANT" in joined or "MAID" in joined:
-        return "servant_room"
-    return "bedroom"
+
+    if code == "bedroom":
+        if "MASTER" in joined or "M.BED" in joined or "M. BED" in joined:
+            return "master_bedroom"
+        if "SERVANT" in joined or "MAID" in joined:
+            return "servant_room"
+        if ("KIDS" in joined or "KID'S" in joined
+                or "CHILDREN" in joined or "CHILD" in joined):
+            return "kids_room"
+        if "GUEST" in joined:
+            return "guest_room"
+        return "bedroom"
+
+    if code == "bathroom":
+        # MASTER is tested first: an "M.TOILET" beside the master bedroom is a
+        # master bathroom, and a powder room is never also a master bath.
+        if ("M.TOILET" in joined or "M. TOILET" in joined
+                or "MASTER TOILET" in joined or "MASTER BATH" in joined
+                or "M.BATH" in joined):
+            return "master_bathroom"
+        if "POWDER" in joined:
+            return "powder_room"
+        return "bathroom"
+
+    if code == "living_room":
+        # A home theatre is a room the model reads as a living room; only the
+        # printed name says otherwise. Rare in apartment brochures, common in
+        # villa plans, and worth 2 published systems that have never sold.
+        if ("THEATRE" in joined or "THEATER" in joined
+                or "CINEMA" in joined or "MEDIA ROOM" in joined):
+            return "home_theatre"
+        return "living_room"
+
+    return code
 
 
 def _fractional_polygon_area(polygon_points: list[dict]) -> float:
@@ -1495,6 +1568,11 @@ Room label guidance:
 - "Passage", "Corridor", "Gallery"               → passage
 - "Staircase", "Stair", "Lift"                   → staircase
 - "Servant", "Maid", "Staff"                     → servant_room
+- "Kids", "Children", "Child Bedroom"            → kids_room
+- "Guest Bedroom", "Guest Room"                  → guest_room
+- "Home Theatre", "Theater", "Media Room"        → home_theatre
+- "Powder Room", "Powder"                        → powder_room
+- "Master Toilet", "M.Toilet", "Master Bath"     → master_bathroom
 - "Store", "Storage", "Dry Balcony"              → store
 - "Terrace", "Deck", "Roof"                      → terrace
 - Anything else                                  → other
