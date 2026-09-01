@@ -865,14 +865,44 @@ Respond with JSON only, no markdown:
         }],
     )
 
-    return _parse_json_response(response.content[0].text, {
-        "drawing_scale":       None,
-        "unit_system":         "mm",
-        "north_direction_deg": 0,
-        # A parse failure means we learned NOTHING about the scale. 0.3 was a
-        # number that looked like evidence; 0.0 is the truth.
-        "confidence":          0.0,
-    })
+    parsed = _parse_json_response(response.content[0].text, {})
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    # ⚠️ A DEFAULT DOES NOT CATCH AN EXPLICIT NULL. `d.get(k, default)` returns
+    # the default only when the key is ABSENT - a key present with the value
+    # None returns None, and the caller ships that. Normalising here rather
+    # than at each call site, because the value travels a long way: unit_system
+    # picks the parsing branch in Step 7's ocr_to_mm, and getting it wrong turns
+    # every dimension on the plan into a different number.
+    #
+    # `drawing_scale` is the exception and stays nullable on purpose - null is
+    # the honest answer for a drawing that prints no scale, and Ekatan's
+    # callback accepts it as data rather than as a malformed payload.
+    unit = parsed.get("unit_system")
+    if unit not in ("mm", "feet_inches", "m"):
+        unit = "mm"
+
+    try:
+        confidence = float(parsed.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    north = parsed.get("north_direction_deg")
+    if not isinstance(north, (int, float)) or not (0 <= north <= 360):
+        north = 0
+
+    scale = parsed.get("drawing_scale")
+    if scale is not None and not isinstance(scale, str):
+        scale = None
+
+    return {
+        "drawing_scale":       scale[:50] if isinstance(scale, str) else None,
+        "unit_system":         unit,
+        "north_direction_deg": int(north),
+        "confidence":          confidence,
+    }
 
 
 def _crop_title_block(image_bytes: bytes) -> bytes:
