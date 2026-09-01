@@ -399,6 +399,19 @@ else:
           len(sanitize(notched_bedroom)) == len(notched_bedroom),
           "this is the requirement, not a bug: an L-shaped room must stay L-shaped")
 
+    # ⚠️ FOUR POINTS ARE NOT AUTOMATICALLY A BOX. There was an early return here
+    # saying they were, and a designer kept seeing one kitchen with a single
+    # diagonal wall after everything else had been squared up: a four-point
+    # trapezoid skipped the rectilinear check entirely.
+    trapezoid = pts((0.10, 0.10), (0.50, 0.20), (0.50, 0.40), (0.10, 0.40))
+    check("a FOUR-POINT trapezoid is boxed, not waved through",
+          sanitize(trapezoid) != trapezoid,
+          "four points are not automatically a rectangle")
+    wobble = pts((0.10, 0.10), (0.50, 0.1005), (0.50, 0.40), (0.10, 0.40))
+    check("a rectangle with sub-pixel raster wobble is still kept",
+          sanitize(wobble) == wobble,
+          "raster stair-stepping is noise, not a diagonal wall")
+
     box = sanitize(master_bedroom)
     check("the box spans the original's full extent",
           abs(min(p["x"] for p in box) - 0.4647) < 1e-9
@@ -480,6 +493,45 @@ check("a well-formed pair still parses",
 check("a pair with an apostrophe dropped entirely is NOT guessed at",
       parse_pair("11'6x110") is None,
       "110 could be 11'0\" or 1'10\" — no dimension beats an invented one")
+
+# ─── 10. The drawing outranks the model ──────────────────────────────────────
+# A live run logged this twice and lost the room both times:
+#   rejected 26-toilet->bathroom: label disagrees ('UTILITY 5'9"WIDE')
+# The model saw a sink and a washing machine and said "toilet"; the gate refused
+# to store a bathroom over a space the drawing calls UTILITY, and then dropped
+# it. The gate was right and the outcome was still wrong — the plan came back
+# with no utility at all.
+print("\n10. A disagreeing label retypes the room instead of deleting it")
+
+for pat in [r"^YOLO_ROOM_TO_CODE = \{.*?^\}",
+            r"^YOLO_LABEL_AGREEMENT = \{.*?^\}",
+            r"^def _rescue_code_from_label\(.*?\n(?=\n\ndef |\n\n# |\n\n@|\n\n[A-Z_]+ =)"]:
+    m = re.search(pat, SRC, re.M | re.S)
+    if not m:
+        print("  FAIL could not extract %s" % pat[:40])
+        failures.append("extract " + pat[:40])
+    else:
+        exec(m.group(0), env)
+
+rescue = env["_rescue_code_from_label"]
+
+check("the text that deleted a utility twice now recovers it",
+      rescue('UTILITY 5\'9"WIDE') == "utility")
+check("a toilet label resolves to bathroom",
+      rescue("TOILET 8'6X5'6") == "bathroom")
+check("a balcony label resolves to balcony",
+      rescue('BALCONY 5\'0"WIDE') == "balcony")
+check("two room names in one polygon rescues nothing",
+      rescue("BEDROOM TOILET") is None,
+      "that polygon spans two rooms; guessing would reintroduce mislabelling")
+check("text naming no room rescues nothing",
+      rescue("GODREJ ROYALE WOODS") is None)
+# Refinement-only codes must not be reachable here — TOILET matches bathroom,
+# master_bathroom and powder_room, and without the predictable-only filter the
+# result would be ambiguous and nothing would ever be rescued.
+check("only codes the model can predict are candidates",
+      rescue("MASTER TOILET") in (None, "bathroom"),
+      "got %r" % rescue("MASTER TOILET"))
 
 # ─── Result ───────────────────────────────────────────────────────────────────
 print("\n%d checks failed" % len(failures))

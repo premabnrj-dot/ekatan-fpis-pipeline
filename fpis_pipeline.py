@@ -427,6 +427,15 @@ def _run_all_steps(payload: dict) -> dict:
     rooms_reconciled = _step7_reconcile(rooms_raw, ocr_results, scale_info)
     print(f"[Step 7] Reconciled rooms: {len(rooms_reconciled)}")
 
+    # ── Step 7b: read the dimensions OCR could not ────────────────────────────
+    rooms_reconciled = _step7b_verify_dimensions(processed_bytes, rooms_reconciled)
+
+    # Walls and openings become real millimetres LAST, once every source of a
+    # room dimension has been tried - OCR in Step 7, then the drawing itself in
+    # 7b. Doing this inside Step 7 measured walls against the OCR answer and
+    # never revisited them when 7b recovered a better one.
+    _rescale_walls_to_mm(rooms_reconciled)
+
     # ── Step 8: Rules Engine ─────────────────────────────────────────────────
     rooms_final = _step8_rules_engine(rooms_reconciled, carpet_area)
     print(f"[Step 8] Final rooms: {len(rooms_final)}")
@@ -1023,15 +1032,49 @@ MAX_ROOM_POLYGON_VERTS = 10
 # An edge shorter than this fraction of the room's bounding diagonal is raster
 # stair-stepping, not a wall, and is exempt from the rectilinear test below.
 RECTILINEAR_MIN_EDGE_FRAC = 0.06
-# sin(12°). A substantial edge further off-axis than this means the outline is a
+# sin(8.6°). A substantial edge further off-axis than this means the outline is a
 # mask artefact rather than a room, and the whole polygon falls back to its box.
-RECTILINEAR_SIN_TOLERANCE = 0.208
+# Deliberately TIGHTER than `_rectify_contour`'s own snap (slope ratio 0.18, or
+# 10.2°), so the rule composes into something simple: if rectification could not
+# square an edge, this boxes the room. A looser value here leaves a band of
+# angles that neither pass flattens, which is exactly where the kitchen with one
+# diagonal wall lived.
+RECTILINEAR_SIN_TOLERANCE = 0.15
 
 # Two detections of the SAME room type overlapping by at least this much are one
 # room found twice, not two rooms. Set well above the incidental overlap of two
 # genuinely adjacent rooms of one type (two bedrooms sharing a wall overlap at
 # ~0), and below the near-identical duplicates the model actually emits.
 DUPLICATE_ROOM_IOU = 0.60
+
+# ─── Furniture absorption (see _absorb_furniture) ─────────────────────────────
+# Classes that are FURNITURE STANDING ON A ROOM'S FLOOR. The room mask stops at
+# each of these instead of at the wall, so unioning them back repairs the
+# outline. The model already produces them and Step 6 used to discard all of it.
+FURNITURE_ABSORB_CLASSES = {
+    "1-Bed", "4-Dining table", "8-Sofa", "11-Wardrobe", "14-commode",
+    "16-dress", "18-fridge", "20-kitchen-slab", "23-sink", "24-stove",
+    "27-tv", "30-wash", "31-washing-machine",
+}
+# ⚠️ `17-duct` AND `21-lift` ARE DELIBERATELY ABSENT. A shaft or a lift core is a
+# genuine HOLE in the plan, not occluded floor — it is not part of any room and
+# absorbing it would grow a room into a void nobody can use or sell. "Everything
+# that is not a room or a door" would be the obvious rule and the wrong one.
+FURNITURE_MIN_CONF = 0.25
+# Fraction of a furniture detection that must fall inside the room's bounding
+# box. Measured against the BOX, not the room: the furniture is precisely the
+# region the room mask excluded, so it barely overlaps the room itself.
+FURNITURE_CONTAINMENT = 0.75
+# How close furniture must sit to the room's own mask, as a fraction of the
+# room's bounding diagonal. This is the guard that stops a room absorbing a
+# wardrobe standing in the room NEXT DOOR and growing through its own wall.
+FURNITURE_ADJACENCY_FRAC = 0.03
+# A repair that grows a room by more than this is not a repair.
+FURNITURE_MAX_GROWTH = 1.35
+
+# Rooms handed to Step 7b's dimension re-read. A bound, not a budget: a plan
+# with fifty unmeasured rooms has a problem this step cannot fix.
+VERIFY_DIMENSIONS_MAX_ROOMS = 20
 
 # Words that mean "this polygon is over a room", used to reject detections
 # that landed on a title block or a legend.
@@ -1062,6 +1105,11 @@ ROOM_LABEL_WORDS = (
     # refinement, so adding the refinement alone would have changed nothing.
     "KIDS", "KID'S", "CHILDREN", "CHILD", "THEATRE", "THEATER",
     "CINEMA", "MEDIA", "M.TOILET", "M. TOILET",
+    # Walk-in wardrobe. Plans abbreviate it every possible way, and the one seen
+    # on a real Bengaluru plan (2026-09-01) was "WWR 8'6"x5'0"" — a well
+    # dimensioned, sellable space that this pipeline could not name, so its
+    # detection was thrown out one gate before it could be typed.
+    "WWR", "WIW", "W.I.W", "WALK IN WARDROBE", "WALK-IN WARDROBE", "WARDROBE",
 )
 
 # The printed label must AGREE with the predicted class. This is the gate that
@@ -1110,7 +1158,13 @@ YOLO_LABEL_AGREEMENT = {
     "passage":         ("LOBBY", "PASSAGE", "CORRIDOR"),
     "foyer_entrance":  ("FOYER", "ENTRY", "ENTRANCE"),
     "home_office":     ("STUDY", "OFFICE"),
-    "store":           ("STORE", "WALKIN", "WALK-IN"),
+    # WWR / WIW sit here TEMPORARILY. The model's `29-walkin` class maps to
+    # `store` today, so this is what keeps a walk-in wardrobe from being dropped
+    # at the agreement gate. They move to a `walk_in_wardrobe` code as soon as
+    # that row exists in Ekatan's room_types — emitting the code before the row
+    # exists would fail GUARD #1 and discard the WHOLE extraction, not just the
+    # one room.
+    "store":           ("STORE", "WALKIN", "WALK-IN", "WWR", "WIW", "WARDROBE"),
     "pooja_room":      ("POOJA", "PUJA", "MANDIR"),
 }
 
@@ -1247,6 +1301,43 @@ def _refine_room_code(code: str, texts: list[str]) -> str:
     return code
 
 
+def _rescue_code_from_label(joined: str) -> str | None:
+    """
+    When the model's class disagrees with the drawing, believe the drawing.
+
+    ⚠️ THIS RECOVERS ROOMS THE LABEL GATE USED TO DELETE. Measured on a live
+    plan 2026-09-01, twice in one run:
+
+        rejected 26-toilet->bathroom: label disagrees ('UTILITY 5\\'9"WIDE')
+
+    The model looked at the utility — which has a sink and a washing machine in
+    it — and called it a toilet. The gate correctly refused to store a bathroom
+    over a space the drawing calls UTILITY, and then dropped the detection
+    entirely. So the gate was right and the outcome was still wrong: the plan
+    came back with no utility at all, and a designer had to add it by hand.
+
+    The drawing had already answered the question. `_refine_room_code` acts on
+    exactly this principle for bedrooms and bathrooms; this extends it to the
+    case where the printed name contradicts the class outright rather than
+    refining it.
+
+    ONLY CODES THE MODEL CAN ITSELF PREDICT are candidates. Without that filter
+    the word TOILET matches bathroom, master_bathroom AND powder_room, three
+    codes become ambiguous, and nothing is ever rescued. The refinement-only
+    codes are reached afterwards, from the same text, by the existing path.
+
+    Returns a code only when EXACTLY ONE matches. A polygon carrying two room
+    names is a polygon spanning two rooms, and guessing which one it is would
+    reintroduce the mislabelling this gate exists to stop.
+    """
+    predictable = set(YOLO_ROOM_TO_CODE.values()) - {"other"}
+    hits = {
+        code for code in predictable
+        if any(w in joined for w in YOLO_LABEL_AGREEMENT.get(code, ()))
+    }
+    return hits.pop() if len(hits) == 1 else None
+
+
 def _fractional_polygon_area(polygon_points: list[dict]) -> float:
     """Shoelace area of a fractional polygon. Used to pick the SMALLEST room
     containing a door, so a door inside a bedroom that also falls inside a
@@ -1331,10 +1422,13 @@ def _sanitize_room_polygon(polygon_points: list[dict]) -> list[dict]:
     except Exception:
         return _boxify(polygon_points)
 
-    # Four points that are already a box need no further argument.
-    if len(polygon_points) == 4:
-        return polygon_points
-
+    # ⚠️ NO EARLY RETURN FOR FOUR POINTS. There used to be one — "four points are
+    # already a box" — and it was simply false: `_rectify_contour` readily
+    # produces a four-point TRAPEZOID with one diagonal side, which then skipped
+    # this check entirely. That is why a designer still saw a kitchen with one
+    # diagonal wall after the rest of the plan had been squared up. A genuine
+    # axis-aligned rectangle passes the test below anyway, so the shortcut
+    # bought nothing and hid the one shape it should have caught.
     xs = [p["x"] for p in polygon_points]
     ys = [p["y"] for p in polygon_points]
     diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
@@ -1356,6 +1450,106 @@ def _sanitize_room_polygon(polygon_points: list[dict]) -> list[dict]:
             return _boxify(polygon_points)
 
     return polygon_points
+
+
+def _absorb_furniture(room_xy, furniture_xy, np, label: str = ""):
+    """
+    Fill the furniture back into a room outline, so it traces walls not wardrobes.
+
+    ⚠️ THE MODEL SEGMENTS VISIBLE FLOOR, NOT THE ROOM. A wardrobe drawn against
+    the bedroom wall occludes the floor, so the mask stops at the wardrobe and
+    the traced outline takes a bite out of the room exactly where the wardrobe
+    is. Same for a bed, a sofa, the kitchen slab. Those bites are what produced
+    the spiky outlines a designer saw on 2026-09-01.
+
+    The repair is free: the model already detects that furniture and Step 6 threw
+    every one of those detections away. Union the room's mask with the furniture
+    standing in it and the outline runs to the wall again.
+
+    ── WHY CONTAINMENT IS TESTED AGAINST THE BOUNDING BOX ──────────────────────
+    You cannot ask "does this wardrobe overlap the room?" — it barely does, and
+    that is the entire problem. The wardrobe IS the region the room mask
+    excluded, so the two are ADJACENT, not overlapping. Containment is therefore
+    measured against the room's bounding box.
+
+    ── AND WHY ADJACENCY IS TESTED SEPARATELY ──────────────────────────────────
+    A bounding box is generous, especially for an L-shaped room, so the box test
+    alone would happily swallow a wardrobe standing in the NEXT room and grow
+    this room straight through its own wall. The second test is what prevents
+    that: furniture bitten out of THIS room touches this room's mask, while
+    furniture in the neighbouring room is separated from it by the wall.
+
+    Three guards, and every decision is logged so the next run's Modal logs show
+    exactly what this did on real plans rather than what I assumed it would do.
+    """
+    if len(furniture_xy) == 0 or room_xy is None or len(room_xy) < 3:
+        return room_xy
+    try:
+        from shapely.geometry import Polygon
+        from shapely.ops import unary_union
+    except ImportError:
+        return room_xy
+
+    def _poly(xy):
+        try:
+            p = Polygon([(float(a), float(b)) for a, b in xy])
+            if not p.is_valid:
+                p = p.buffer(0)
+            return p if (not p.is_empty and p.area > 0) else None
+        except Exception:
+            return None
+
+    room = _poly(room_xy)
+    if room is None:
+        return room_xy
+
+    envelope = room.envelope
+    minx, miny, maxx, maxy = room.bounds
+    reach = math.hypot(maxx - minx, maxy - miny) * FURNITURE_ADJACENCY_FRAC
+
+    absorbed, refused = [], []
+    for f_xy in furniture_xy:
+        fp = _poly(f_xy)
+        if fp is None:
+            continue
+        inside = fp.intersection(envelope).area / fp.area
+        if inside < FURNITURE_CONTAINMENT:
+            refused.append(f"outside ({inside:.0%} in box)")
+            continue
+        if fp.distance(room) > reach:
+            # In this room's box, but not touching this room's floor — almost
+            # always a fitting in the room next door.
+            refused.append("not adjacent")
+            continue
+        absorbed.append(fp)
+
+    if not absorbed:
+        if refused:
+            print(f"[Step 6]   {label}: absorbed 0 furniture "
+                  f"({', '.join(refused[:4])})")
+        return room_xy
+
+    try:
+        merged = unary_union([room] + absorbed)
+        if merged.geom_type == "MultiPolygon":
+            merged = max(merged.geoms, key=lambda g: g.area)
+        if merged.is_empty or merged.area <= 0:
+            return room_xy
+    except Exception:
+        return room_xy
+
+    growth = merged.area / room.area
+    if growth > FURNITURE_MAX_GROWTH:
+        # A jump this large is a room eating its neighbour, not a wardrobe being
+        # filled in. Refuse the whole repair rather than pick which part to keep.
+        print(f"[Step 6]   {label}: REFUSED furniture repair, would grow room "
+              f"{growth:.0%} (cap {FURNITURE_MAX_GROWTH:.0%})")
+        return room_xy
+
+    print(f"[Step 6]   {label}: absorbed {len(absorbed)} furniture item(s), "
+          f"room area +{(growth - 1) * 100:.0f}%"
+          + (f", refused {len(refused)}" if refused else ""))
+    return np.array(merged.exterior.coords[:-1], dtype=np.float32)
 
 
 def _dedupe_overlapping_rooms(rooms: list[dict]) -> list[dict]:
@@ -1591,6 +1785,19 @@ def _step6_raster2seq_extract(
     door_candidates: list[dict] = []
     rejected: list[str] = []
 
+    # PASS 1 — collect the furniture. It has to happen before any room is
+    # traced, because a room's outline is repaired using the furniture standing
+    # in it, and detections arrive in no particular order.
+    furniture_xy = [
+        mask_xy
+        for box, mask_xy in zip(result.boxes, result.masks.xy)
+        if names[int(box.cls[0])] in FURNITURE_ABSORB_CLASSES
+        and float(box.conf[0]) >= FURNITURE_MIN_CONF
+    ]
+    print(f"[Step 6] {len(furniture_xy)} furniture detection(s) available to "
+          f"repair room outlines")
+
+    # PASS 2 — rooms and doors.
     for box, mask_xy in zip(result.boxes, result.masks.xy):
         name = names[int(box.cls[0])]
         conf = float(box.conf[0])
@@ -1614,7 +1821,8 @@ def _step6_raster2seq_extract(
         if code is None or conf < YOLO_MIN_CONF:
             continue
 
-        contour = mask_xy.astype(np.int32).reshape(-1, 1, 2)
+        repaired = _absorb_furniture(mask_xy, furniture_xy, np, label=name)
+        contour = repaired.astype(np.int32).reshape(-1, 1, 2)
         rect = _rectify_contour(contour, cv2, np)
         if rect is None:
             rejected.append(f"{name}: degenerate"); continue
@@ -1650,7 +1858,20 @@ def _step6_raster2seq_extract(
                   f"on {base_code!r} instead. Add {code!r} to that table.")
             code = base_code
         if not any(w in joined for w in YOLO_LABEL_AGREEMENT.get(code, ())):
-            rejected.append(f"{name}->{code}: label disagrees ({joined[:28]!r})"); continue
+            # The drawing disagrees with the model. Before dropping the room,
+            # ask whether the drawing named something else we recognise — a
+            # retyped room beats a missing one, and the printed name is the
+            # better authority anyway.
+            rescued = _rescue_code_from_label(joined)
+            if rescued and rescued != code:
+                print(f"[Step 6]   {name}->{code} retyped to {rescued}: "
+                      f"the drawing says so ({joined[:28]!r})")
+                code = _refine_room_code(rescued, texts)
+                if code not in YOLO_LABEL_AGREEMENT:
+                    code = rescued
+            else:
+                rejected.append(f"{name}->{code}: label disagrees ({joined[:28]!r})")
+                continue
 
         rooms.append({
             "room_type_code":        code,
@@ -2299,12 +2520,168 @@ def _step7_reconcile(rooms: list[dict], ocr_results: list[dict], scale_info: dic
             room["room_label"] = room["room_type_code"].replace("_", " ").title()
             room["label_confidence"] = "low"  # fell back to room_type_code as label
 
-    # Wall lengths become real millimetres only now, once room dimensions are
-    # known. See _rescale_walls_to_mm for why this cannot happen at Step 6.
-    _rescale_walls_to_mm(rooms)
-
+    # ⚠️ WALL RESCALING DELIBERATELY DOES NOT HAPPEN HERE ANY MORE. It is the
+    # LAST thing that may run, because it converts walls and openings using the
+    # room's dimensions — and Step 7b can still recover a dimension this step
+    # failed to read. Rescaling here would measure every wall against the OCR
+    # answer and then never revisit it. The orchestrator calls it after 7b.
     return rooms
 
+
+
+def _step7b_verify_dimensions(image_bytes: bytes, rooms: list[dict]) -> list[dict]:
+    """
+    Ask Claude to read the dimensions OCR could not, for rooms still missing them.
+
+    ⚠️ WHY A MODEL AND NOT A BETTER REGEX. PaddleOCR mangles the feet and inch
+    marks, and the damage is not always recoverable by pattern. Measured on a
+    live plan 2026-09-01, the DINING room prints `11'6"x11'0"` and OCR returned:
+
+        11'6x110
+
+    Both inch marks are gone. `110` is either 11'0" or 1'10", and no rule can
+    tell which without looking at the drawing — so the parser correctly refuses
+    it and the room ships with no dimensions, while the number sits legibly in
+    the image. The LIVING room prints 14'6"x12'0" and came back as a single
+    stray token that reconciled to 19812 mm: a 65-foot living room.
+
+    Reading text off an image is the one thing a vision model is unambiguously
+    better at than the pipeline around it, so this is a narrow use of one: it is
+    given ONLY the rooms that are still unmeasured, it is asked ONLY to copy the
+    printed text back verbatim, and the string it returns is parsed by the SAME
+    deterministic parser everything else uses. The model never returns a
+    millimetre value and is never trusted to compute one — it reads, we measure.
+
+    A room whose dimensions came from here is recorded as `printed_pair`,
+    because that is what it is: a pair printed on the drawing. Which reader
+    recovered it is a mechanism detail, and the distinction a designer needs is
+    "off the drawing" versus "inferred".
+    """
+    needy = [
+        (i, r) for i, r in enumerate(rooms)
+        if r.get("length_mm") is None or r.get("width_mm") is None
+        or r.get("dimension_source") in ("ocr_tokens", "none", None)
+    ]
+    if not needy:
+        return rooms
+    needy = needy[:VERIFY_DIMENSIONS_MAX_ROOMS]
+
+    def _centroid(room):
+        pts = room.get("polygon_points") or []
+        if not pts:
+            return 0.5, 0.5
+        return (sum(p["x"] for p in pts) / len(pts),
+                sum(p["y"] for p in pts) / len(pts))
+
+    listing = []
+    for slot, (_, room) in enumerate(needy):
+        cx, cy = _centroid(room)
+        listing.append(f"  {slot}. {room.get('room_label') or room['room_type_code']}"
+                       f"  ({room['room_type_code']}) at ({cx:.2f}, {cy:.2f})")
+
+    try:
+        client = _get_claude()
+        b64, mime = _image_for_claude(image_bytes)
+        prompt = f"""You are reading an Indian residential floor plan.
+
+For each room below, find the dimension text PRINTED ON THE DRAWING for that
+room and copy it back EXACTLY as printed. Positions are fractions of the image,
+x from the left, y from the top.
+
+{chr(10).join(listing)}
+
+Rules:
+- Copy the text VERBATIM, including the feet and inch marks: 14'6"x12'0"
+- The dimensions of a ROOM, never of the furniture standing in it. A bed printed
+  6'6"x6'0" inside a bedroom is not the bedroom.
+- Some rooms print only one dimension, e.g. 5'9"WIDE. Copy that as it appears.
+- If a room prints no dimensions at all, return null for it. NEVER estimate,
+  never measure, never infer from the drawing's scale. A null is useful; a
+  guess is not.
+
+Return a JSON array only, no markdown, one entry per room above:
+[{{"index": 0, "printed": "14'6\\"x12'0\\""}}, {{"index": 1, "printed": null}}]"""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image",
+                     "source": {"type": "base64", "media_type": mime, "data": b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        found = _parse_json_response(response.content[0].text, [])
+    except Exception as exc:
+        print(f"[Step 7b] Dimension verification failed: {exc} - keeping OCR result")
+        return rooms
+
+    if not isinstance(found, list):
+        return rooms
+
+    applied = 0
+    for entry in found:
+        if not isinstance(entry, dict):
+            continue
+        slot = entry.get("index")
+        printed = entry.get("printed")
+        if not isinstance(slot, int) or not (0 <= slot < len(needy)):
+            continue
+        if not isinstance(printed, str) or not printed.strip():
+            continue
+
+        room = needy[slot][1]
+        before = (room.get("length_mm"), room.get("width_mm"))
+
+        pair = _parse_dimension_pair(printed)
+        if pair:
+            a, b = pair
+            room["length_mm"] = int(max(a, b))
+            room["width_mm"] = int(min(a, b))
+            room["dimension_source"] = "printed_pair"
+            room["dimension_confidence"] = "high"
+            applied += 1
+            print(f"[Step 7b]   {room['room_type_code']}: read {printed!r} -> "
+                  f"{room['length_mm']}x{room['width_mm']}mm (was {before})")
+            continue
+
+        single = _parse_single_dimension(printed)
+        if single and room.get("length_mm") is None:
+            # One printed dimension is half an answer, and half is worth having:
+            # a wall run is better measured against it than against nothing.
+            room["length_mm"] = int(single)
+            room["dimension_source"] = "printed_pair"
+            room["dimension_confidence"] = "medium"
+            applied += 1
+            print(f"[Step 7b]   {room['room_type_code']}: read {printed!r} -> "
+                  f"{room['length_mm']}mm (one dimension only)")
+        else:
+            print(f"[Step 7b]   {room['room_type_code']}: {printed!r} did not parse "
+                  f"- left as it was")
+
+    print(f"[Step 7b] Verified {applied} of {len(needy)} unmeasured room(s)")
+    return rooms
+
+
+def _parse_single_dimension(text: str) -> float | None:
+    """One printed dimension in mm, e.g. `5'9"WIDE` -> 1752. None if absent."""
+    s = (text or "").strip()
+    if _parse_dimension_pair(s):
+        return None      # a pair belongs to the pair parser, not here
+    m = re.search(r"(\d+)\s*" + _QUOTE + r"\s*(\d+)?", s)
+    if m:
+        ft = int(m.group(1))
+        inch = int(m.group(2)) if m.group(2) else 0
+        mm = ft * 304.8 + inch * 25.4
+        return mm if 300 <= mm <= 30000 else None
+    m = re.fullmatch(r"\s*(\d{3,5})\s*(?:mm)?\s*", s, re.I)
+    if m:
+        mm = float(m.group(1))
+        return mm if 300 <= mm <= 30000 else None
+    return None
 
 
 def _rescale_walls_to_mm(rooms: list[dict]) -> None:
