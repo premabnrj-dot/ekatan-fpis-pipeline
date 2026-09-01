@@ -505,6 +505,7 @@ print("\n10. A disagreeing label retypes the room instead of deleting it")
 
 for pat in [r"^YOLO_ROOM_TO_CODE = \{.*?^\}",
             r"^YOLO_LABEL_AGREEMENT = \{.*?^\}",
+            r"^REFINEMENT_ONLY_CODES = \{.*?^\}",
             r"^def _rescue_code_from_label\(.*?\n(?=\n\ndef |\n\n# |\n\n@|\n\n[A-Z_]+ =)"]:
     m = re.search(pat, SRC, re.M | re.S)
     if not m:
@@ -529,9 +530,18 @@ check("text naming no room rescues nothing",
 # Refinement-only codes must not be reachable here — TOILET matches bathroom,
 # master_bathroom and powder_room, and without the predictable-only filter the
 # result would be ambiguous and nothing would ever be rescued.
-check("only codes the model can predict are candidates",
+check("refinement-only codes are not candidates",
       rescue("MASTER TOILET") in (None, "bathroom"),
       "got %r" % rescue("MASTER TOILET"))
+# ⚠️ The candidate set is NOT "what the model predicts". It was, briefly, and
+# `store` broke the moment 29-walkin was retyped to walk_in_wardrobe: store
+# stopped being any class's output, so a polygon plainly labelled STORE could no
+# longer be rescued to it.
+check("a code no class predicts can still be rescued from its printed name",
+      rescue("STORE") == "store",
+      "store has no YOLO class of its own since 29-walkin was retyped")
+check("a walk-in wardrobe is rescued from the abbreviation plans actually use",
+      rescue("WWR") == "walk_in_wardrobe")
 
 # ─── Result ───────────────────────────────────────────────────────────────────
 print("\n%d checks failed" % len(failures))

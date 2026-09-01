@@ -194,6 +194,13 @@ VALID_ROOM_CODES = {
     "kitchen", "bathroom", "pooja_room", "home_office",
     "foyer_entrance", "balcony", "utility", "passage", "staircase",
     "servant_room", "store", "terrace", "other",
+    # Added 2026-09-02 with Ekatan migration 0390. The model has ALWAYS detected
+    # these - `29-walkin` mapped to `store` since the class map was written - so
+    # every walk-in wardrobe this pipeline ever found was filed as a store room.
+    # A walk-in is nothing but storage and one of the most sellable rooms in a
+    # flat; a store room is a box for luggage. Same shape of error as the
+    # balcony/utility collapse (ADR-133), and the same cost.
+    "walk_in_wardrobe",
     # These five are reached ONLY by `_refine_room_code`, never by the model.
     # Each is a bedroom or a bathroom in SHAPE - nothing about the outline tells
     # them apart, only the printed name does - so they are deliberately NOT
@@ -211,6 +218,16 @@ VALID_OPENING_CODES = {
     "pocket_door", "window_standard", "window_bay", "window_corner",
     "ventilator", "arched_opening", "niche_shallow", "niche_deep",
     "exhaust_opening", "duct_access", "pass_through", "meter_box",
+}
+
+# The seven codes NO CLASS PREDICTS — every one is reached only by
+# `_refine_room_code` reading the printed name, because each is identical in
+# SHAPE to its base type. A kids room is a bedroom; a powder room is a bathroom.
+# Kept as one named set because two different rules need it and both were
+# spelling it out separately.
+REFINEMENT_ONLY_CODES = {
+    "master_bedroom", "servant_room", "kids_room", "guest_room",
+    "home_theatre", "powder_room", "master_bathroom",
 }
 
 # Rooms that must always have is_wet_area = true
@@ -1008,7 +1025,12 @@ YOLO_ROOM_TO_CODE = {
     "25-study":          "home_office",
     "26-toilet":         "bathroom",
     "28-utility":        "utility",
-    "29-walkin":         "store",
+    # ⚠️ THIS MAPPED TO `store` UNTIL 2026-09-02, and that was the bug: the class
+    # is literally named "walkin". Ekatan's room_types now carries
+    # `walk_in_wardrobe` (migration 0390, applied to production first — emitting
+    # a code before its row exists fails GUARD #1 and discards the WHOLE
+    # extraction, not just the room).
+    "29-walkin":         "walk_in_wardrobe",
 }
 
 YOLO_DOOR_CLASS      = "15-door"
@@ -1158,13 +1180,14 @@ YOLO_LABEL_AGREEMENT = {
     "passage":         ("LOBBY", "PASSAGE", "CORRIDOR"),
     "foyer_entrance":  ("FOYER", "ENTRY", "ENTRANCE"),
     "home_office":     ("STUDY", "OFFICE"),
-    # WWR / WIW sit here TEMPORARILY. The model's `29-walkin` class maps to
-    # `store` today, so this is what keeps a walk-in wardrobe from being dropped
-    # at the agreement gate. They move to a `walk_in_wardrobe` code as soon as
-    # that row exists in Ekatan's room_types — emitting the code before the row
-    # exists would fail GUARD #1 and discard the WHOLE extraction, not just the
-    # one room.
-    "store":           ("STORE", "WALKIN", "WALK-IN", "WWR", "WIW", "WARDROBE"),
+    "store":           ("STORE", "STORAGE", "LUGGAGE"),
+    # A walk-in is named every possible way on Indian plans. "WWR" is the one
+    # seen live; the rest are the spellings Ekatan's resolver already accepts.
+    # WALKIN / WALK-IN moved OFF `store` deliberately - leaving them on both
+    # would make `_rescue_code_from_label` ambiguous for the exact word that
+    # identifies this room, and it rescues only on a unique match.
+    "walk_in_wardrobe": ("WWR", "WIW", "W.I.W", "WALK IN", "WALK-IN", "WALKIN",
+                         "WARDROBE", "DRESS"),
     "pooja_room":      ("POOJA", "PUJA", "MANDIR"),
 }
 
@@ -1321,18 +1344,25 @@ def _rescue_code_from_label(joined: str) -> str | None:
     case where the printed name contradicts the class outright rather than
     refining it.
 
-    ONLY CODES THE MODEL CAN ITSELF PREDICT are candidates. Without that filter
-    the word TOILET matches bathroom, master_bathroom AND powder_room, three
-    codes become ambiguous, and nothing is ever rescued. The refinement-only
-    codes are reached afterwards, from the same text, by the existing path.
+    THE REFINEMENT-ONLY CODES ARE EXCLUDED, and that exclusion is load-bearing:
+    without it the word TOILET matches bathroom, master_bathroom AND
+    powder_room, three codes tie, and nothing is ever rescued. Those seven are
+    reached afterwards from the same text by `_refine_room_code`, which is where
+    that decision belongs.
+
+    ⚠️ THE CANDIDATE SET IS NOT "WHAT THE MODEL PREDICTS". It was, briefly, and
+    that broke `store` the moment `29-walkin` was retyped to walk_in_wardrobe:
+    store stopped being any class's output, so a polygon plainly labelled STORE
+    could no longer be rescued to it. What a class map happens to emit today is
+    not the right basis for what a printed word is allowed to mean.
 
     Returns a code only when EXACTLY ONE matches. A polygon carrying two room
     names is a polygon spanning two rooms, and guessing which one it is would
     reintroduce the mislabelling this gate exists to stop.
     """
-    predictable = set(YOLO_ROOM_TO_CODE.values()) - {"other"}
+    candidates = set(YOLO_LABEL_AGREEMENT) - REFINEMENT_ONLY_CODES - {"other"}
     hits = {
-        code for code in predictable
+        code for code in candidates
         if any(w in joined for w in YOLO_LABEL_AGREEMENT.get(code, ()))
     }
     return hits.pop() if len(hits) == 1 else None
