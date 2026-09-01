@@ -975,6 +975,19 @@ RECTIFY_FILL_RATIO   = 0.86
 # had otherwise produced 6 good rooms and 9 doors.
 MAX_ROOM_POLYGON_VERTS = 10
 
+# An edge shorter than this fraction of the room's bounding diagonal is raster
+# stair-stepping, not a wall, and is exempt from the rectilinear test below.
+RECTILINEAR_MIN_EDGE_FRAC = 0.06
+# sin(12°). A substantial edge further off-axis than this means the outline is a
+# mask artefact rather than a room, and the whole polygon falls back to its box.
+RECTILINEAR_SIN_TOLERANCE = 0.208
+
+# Two detections of the SAME room type overlapping by at least this much are one
+# room found twice, not two rooms. Set well above the incidental overlap of two
+# genuinely adjacent rooms of one type (two bedrooms sharing a wall overlap at
+# ~0), and below the near-identical duplicates the model actually emits.
+DUPLICATE_ROOM_IOU = 0.60
+
 # Words that mean "this polygon is over a room", used to reject detections
 # that landed on a title block or a legend.
 # ⚠️ BUILDERS RENAME ROOMS FOR MARKETING, and this list is what decides whether
@@ -1204,6 +1217,165 @@ def _fractional_polygon_area(polygon_points: list[dict]) -> float:
     return abs(total) / 2.0
 
 
+def _boxify(polygon_points: list[dict]) -> list[dict]:
+    """The axis-aligned bounding box of a polygon, wound clockwise from top-left."""
+    xs = [p["x"] for p in polygon_points]
+    ys = [p["y"] for p in polygon_points]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    return [{"x": x0, "y": y0}, {"x": x1, "y": y0},
+            {"x": x1, "y": y1}, {"x": x0, "y": y1}]
+
+
+def _sanitize_room_polygon(polygon_points: list[dict]) -> list[dict]:
+    """
+    A room outline that crosses itself, or wanders off-axis, is not a room.
+    Replace it with its box.
+
+    ⚠️ THIS IS THE SINGLE BIGGEST QUALITY PROBLEM IN THE SEGMENTATION PATH, and
+    it was invisible until the geometry started being rendered faithfully.
+    Measured on a live Bengaluru plan, 2026-09-01 — the master bedroom shipped as
+
+        (0.625,0.818) (0.625,0.985) (0.465,0.985) (0.465,0.747)
+        (0.855,0.747) (0.855,0.985)
+
+    whose closing edge cuts diagonally back through the middle of the shape. A
+    bowtie. Another room visited one vertex TWICE in the same ring. Of nine
+    rooms on that plan, most were spirals like this.
+
+    `_rectify_contour`'s bounding-box snap is supposed to catch the hopeless
+    cases, and it structurally cannot catch THESE: it compares `cv2.contourArea`
+    against the box, and contourArea on a self-intersecting ring returns the
+    ALGEBRAIC area, where the clockwise and counter-clockwise lobes cancel. A
+    spiral therefore reports a near-zero area, the fill ratio comes out tiny,
+    and the snap never fires — so the worst polygons are precisely the ones that
+    keep their shape.
+
+    Shapely is the right judge (`is_valid` is false for a self-intersecting
+    ring) and it is already in the GPU image. An honest rectangle in the right
+    place beats an accurate-looking spiral: the box is what a designer would
+    have drawn anyway, and every consumer — the review overlay, the 3D view,
+    `findWallEdge` — behaves sanely on four edges.
+
+    ── AND VALIDITY ALONE IS NOT ENOUGH ────────────────────────────────────────
+    The same plan produced a DINING room that was a perfectly valid quadrilateral
+    and still nonsense: a long diagonal chord sliced across it, because
+    Douglas-Peucker cut a corner off a mask that had leaked through a doorway.
+    Shapely is happy with that shape. A designer would not be.
+
+    Indian residential plans are overwhelmingly RECTILINEAR — walls meet at right
+    angles. A significant edge running at 40° is therefore evidence of a mask
+    artefact, not of an unusual room. So a non-rectangular outline is kept only
+    when every substantial edge is near an axis; anything else becomes its box.
+
+    This deliberately keeps genuine L-shapes, which are rectilinear, and discards
+    diagonal-chord artefacts, which are not. Short edges are exempt: a two-pixel
+    stair-step on an otherwise square corner is noise, not a diagonal wall.
+    """
+    if len(polygon_points) < 4:
+        return polygon_points
+
+    try:
+        from shapely.geometry import Polygon
+    except ImportError:
+        return polygon_points
+
+    try:
+        poly = Polygon([(p["x"], p["y"]) for p in polygon_points])
+        if not poly.is_valid or poly.area <= 0:
+            return _boxify(polygon_points)
+    except Exception:
+        return _boxify(polygon_points)
+
+    # Four points that are already a box need no further argument.
+    if len(polygon_points) == 4:
+        return polygon_points
+
+    xs = [p["x"] for p in polygon_points]
+    ys = [p["y"] for p in polygon_points]
+    diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+    if diag <= 1e-9:
+        return _boxify(polygon_points)
+
+    n = len(polygon_points)
+    for i in range(n):
+        a, b = polygon_points[i], polygon_points[(i + 1) % n]
+        dx, dy = b["x"] - a["x"], b["y"] - a["y"]
+        edge = math.hypot(dx, dy)
+        # Ignore short edges - they are the stair-stepping of a raster mask,
+        # not walls anyone drew.
+        if edge < RECTILINEAR_MIN_EDGE_FRAC * diag:
+            continue
+        # Angle to the nearer axis, in degrees.
+        off_axis = min(abs(dx), abs(dy)) / edge      # sin of that angle
+        if off_axis > RECTILINEAR_SIN_TOLERANCE:
+            return _boxify(polygon_points)
+
+    return polygon_points
+
+
+def _dedupe_overlapping_rooms(rooms: list[dict]) -> list[dict]:
+    """
+    One room detected twice is one room. Keep the more confident copy.
+
+    The model returns overlapping instances for the same space, and nothing
+    downstream merges them. Measured on a live plan 2026-09-01: the KITCHEN came
+    through twice, as rooms 7 and 9, with polygons differing by a few hundredths
+    of a fraction. Both were stored, both drew, and both would have been priced.
+
+    Only same-typed rooms are compared. Two DIFFERENT room types overlapping is
+    ordinary and must not be touched - a bathroom's box legitimately sits inside
+    a bedroom's, and the door assigner already relies on that nesting.
+    """
+    if len(rooms) < 2:
+        return rooms
+    try:
+        from shapely.geometry import Polygon
+    except ImportError:
+        return rooms
+
+    def _poly(room):
+        pts = room.get("polygon_points") or []
+        if len(pts) < 3:
+            return None
+        try:
+            p = Polygon([(q["x"], q["y"]) for q in pts])
+            return p if p.is_valid and p.area > 0 else None
+        except Exception:
+            return None
+
+    dropped: set[int] = set()
+    for i in range(len(rooms)):
+        if i in dropped:
+            continue
+        pi = _poly(rooms[i])
+        if pi is None:
+            continue
+        for j in range(i + 1, len(rooms)):
+            if j in dropped:
+                continue
+            if rooms[j].get("room_type_code") != rooms[i].get("room_type_code"):
+                continue
+            pj = _poly(rooms[j])
+            if pj is None:
+                continue
+            union = pi.union(pj).area
+            if union <= 0:
+                continue
+            if (pi.intersection(pj).area / union) < DUPLICATE_ROOM_IOU:
+                continue
+            # Same room, twice. The more confident detection wins; on a tie the
+            # earlier one does, so the result does not depend on iteration order.
+            loser = j if (rooms[j].get("extraction_confidence") or 0) <= \
+                         (rooms[i].get("extraction_confidence") or 0) else i
+            dropped.add(loser)
+            print(f"[Step 6]   dropped duplicate {rooms[loser]['room_type_code']} "
+                  f"(IoU >= {DUPLICATE_ROOM_IOU})")
+            if loser == i:
+                break
+
+    return [r for k, r in enumerate(rooms) if k not in dropped]
+
+
 def _ensure_clockwise(polygon_points: list[dict]) -> list[dict]:
     """
     Wind a fractional polygon clockwise as seen on the page, reversing if not.
@@ -1406,10 +1578,10 @@ def _step6_raster2seq_extract(
         if not (YOLO_MIN_AREA_FRAC <= area_frac <= YOLO_MAX_AREA_FRAC):
             rejected.append(f"{name}: area {area_frac:.2%}"); continue
 
-        polygon_points = _ensure_clockwise([
+        polygon_points = _ensure_clockwise(_sanitize_room_polygon([
             {"x": round(float(p[0][0]) / W, 4), "y": round(float(p[0][1]) / H, 4)}
             for p in rect
-        ])
+        ]))
         texts = _texts_inside_polygon(polygon_points, ocr_results)
         joined = " ".join(texts).upper()
 
@@ -1449,6 +1621,13 @@ def _step6_raster2seq_extract(
 
     for line in rejected:
         print(f"[Step 6]   rejected {line}")
+
+    # Before the minimum-rooms gate, so a plan is never rescued by counting the
+    # same room twice — and before door assignment, so a door is not credited to
+    # a duplicate that is about to disappear.
+    rooms = _dedupe_overlapping_rooms(rooms)
+    for idx, room in enumerate(rooms):
+        room["sort_order"] = idx + 1
 
     if len(rooms) < YOLO_MIN_ROOMS:
         print(f"[Step 6] Only {len(rooms)} room(s) survived the gates "
@@ -2145,11 +2324,25 @@ def _rescale_walls_to_mm(rooms: list[dict]) -> None:
                     _resolve_openings_to_mm(wall, scale)
                 continue
 
-        # No usable dimensions: say so rather than invent a length. The openings
-        # go out with null measurements for the same reason - Ekatan reads a
-        # null offset as "unpositioned" and still draws the room, where a made-up
-        # number would be silently priced.
+        # No usable dimensions: say so rather than invent a length.
+        #
+        # ⚠️ THE WALL ITSELF MUST GO OUT NULL TOO, AND FOR A WHILE IT DID NOT.
+        # This branch used to null only the openings and leave `wall_length_mm`
+        # holding the `frac x 10000` placeholder, which then shipped as
+        # millimetres — the exact defect this function exists to prevent, left
+        # standing in the one branch that admits it cannot measure. Caught on a
+        # live plan on 2026-09-01: a master bedroom whose width never resolved
+        # reported a 1667 mm wall for an edge that was 0.1668 of the image, and
+        # the living room reported 3546 for 0.3546. Every one of those numbers
+        # was the image fraction wearing a millimetre label.
+        #
+        # A room reaches here whenever EITHER dimension is missing, which is
+        # common — five of nine rooms on that plan. Ekatan takes a null length
+        # without complaint (`wallLengthMm: number | null`) and falls back to the
+        # room's own extent when it renders, so null costs nothing and a
+        # fabricated number costs a wardrobe sized against the image.
         for wall in placeholder:
+            wall["wall_length_mm"] = None
             for op in wall.get("openings") or []:
                 if "_along_frac" in op:
                     op["rough_width_mm"] = None

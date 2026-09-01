@@ -327,6 +327,115 @@ for r in (room, tall, side, blind):
             leaked |= {k for k in o if k in PRIVATE}
 check("no underscore-prefixed keys survive to the payload", not leaked, str(leaked))
 
+# ─── 8. Polygon sanitising, against REAL production polygons ─────────────────
+# Every polygon below was read out of the production database on 2026-09-01,
+# verbatim. Six of the nine rooms on that plan were spirals or had diagonal
+# chords slicing across them; the designer's screenshot showed a kitchen with a
+# spike stabbing into its own middle. Invented fixtures would not have caught
+# this, so these are the real ones.
+print("\n8. Polygon sanitising (real production polygons, 2026-09-01)")
+
+try:
+    import shapely  # noqa: F401
+    HAVE_SHAPELY = True
+except ImportError:
+    HAVE_SHAPELY = False
+
+if not HAVE_SHAPELY:
+    # The rest of this file runs on bare CPython by design; only this section
+    # needs Shapely, so it is skipped rather than failing the run.
+    print("  skipped — shapely not installed locally (it is in the Modal image)")
+else:
+    for pat, dot in [
+        (r"^RECTILINEAR_MIN_EDGE_FRAC = [^\n]*$", False),
+        (r"^RECTILINEAR_SIN_TOLERANCE = [^\n]*$", False),
+        (r"^DUPLICATE_ROOM_IOU = [^\n]*$", False),
+        (r"^def _boxify\(.*?\n(?=\n\ndef |\n\n# |\n\n@|\n\n[A-Z_]+ =)", True),
+        (r"^def _sanitize_room_polygon\(.*?\n(?=\n\ndef |\n\n# |\n\n@|\n\n[A-Z_]+ =)", True),
+        (r"^def _dedupe_overlapping_rooms\(.*?\n(?=\n\ndef |\n\n# |\n\n@|\n\n[A-Z_]+ =)", True),
+    ]:
+        m = re.search(pat, SRC, re.M | (re.S if dot else 0))
+        if not m:
+            print("  FAIL could not extract %s" % pat[:44])
+            failures.append("extract " + pat[:44])
+        else:
+            exec(m.group(0), env)
+
+    sanitize = env["_sanitize_room_polygon"]
+    dedupe = env["_dedupe_overlapping_rooms"]
+
+    def pts(*xy):
+        return [{"x": x, "y": y} for x, y in xy]
+
+    # A bowtie: the closing edge cuts diagonally back through the shape.
+    master_bedroom = pts((0.625, 0.8184), (0.625, 0.9852), (0.4647, 0.9852),
+                         (0.4647, 0.7466), (0.8546, 0.7466), (0.8546, 0.9852))
+    # Shapely calls this VALID. It is still not a room — a long diagonal chord.
+    dining = pts((0.4579, 0.3316), (0.4579, 0.3696), (0.5815, 0.4266),
+                 (0.5815, 0.6304), (0.3478, 0.5956), (0.2772, 0.6135),
+                 (0.2772, 0.3316))
+    # Visits (0.0897, 0.5723) twice in one ring.
+    kitchen = pts((0.0897, 0.5723), (0.0897, 0.397), (0.1997, 0.4403),
+                  (0.2758, 0.397), (0.2758, 0.4509), (0.2024, 0.4509),
+                  (0.2704, 0.5111), (0.2704, 0.6209), (0.0897, 0.5723),
+                  (0.0272, 0.6209))
+    living = pts((0.4959, 0.2566), (0.8505, 0.2566),
+                 (0.8505, 0.5164), (0.4959, 0.5164))
+    # A rectilinear notch, where an attached bathroom cuts into the bedroom.
+    notched_bedroom = pts((0.9837, 0.5174), (0.9837, 0.7434), (0.7554, 0.7434),
+                          (0.8913, 0.7413), (0.8913, 0.6019), (0.7473, 0.6019),
+                          (0.7473, 0.7413), (0.6495, 0.7413), (0.6495, 0.5174))
+
+    check("a self-intersecting bowtie becomes its box",
+          len(sanitize(master_bedroom)) == 4)
+    check("a VALID polygon with a diagonal chord still becomes its box",
+          len(sanitize(dining)) == 4,
+          "shapely validity alone would have kept this")
+    check("a ring that revisits a vertex becomes its box",
+          len(sanitize(kitchen)) == 4)
+    check("a clean rectangle is left alone",
+          sanitize(living) == living)
+    check("a RECTILINEAR notch survives — irregular rooms stay irregular",
+          len(sanitize(notched_bedroom)) == len(notched_bedroom),
+          "this is the requirement, not a bug: an L-shaped room must stay L-shaped")
+
+    box = sanitize(master_bedroom)
+    check("the box spans the original's full extent",
+          abs(min(p["x"] for p in box) - 0.4647) < 1e-9
+          and abs(max(p["x"] for p in box) - 0.8546) < 1e-9
+          and abs(min(p["y"] for p in box) - 0.7466) < 1e-9
+          and abs(max(p["y"] for p in box) - 0.9852) < 1e-9)
+    check("the box is wound clockwise, like every other polygon we emit",
+          signed_area(box) > 0)
+
+    # The same kitchen, detected twice — rooms 7 and 9 of that plan.
+    kitchen_b = pts((0.091, 0.5723), (0.091, 0.397), (0.1427, 0.4424),
+                    (0.2717, 0.397), (0.2717, 0.4498), (0.2024, 0.4615),
+                    (0.2717, 0.5111), (0.2717, 0.6209), (0.0897, 0.5723),
+                    (0.0272, 0.6209))
+    dupes = [
+        {"room_type_code": "kitchen", "extraction_confidence": 0.7,
+         "polygon_points": sanitize(kitchen)},
+        {"room_type_code": "kitchen", "extraction_confidence": 0.9,
+         "polygon_points": sanitize(kitchen_b)},
+    ]
+    kept = dedupe(dupes)
+    check("one kitchen detected twice collapses to one",
+          len(kept) == 1, "got %d" % len(kept))
+    check("the more confident detection is the one kept",
+          kept and kept[0]["extraction_confidence"] == 0.9)
+
+    # A bathroom's box legitimately sits inside a bedroom's. Different types
+    # must never be merged — the door assigner depends on that nesting.
+    nested = [
+        {"room_type_code": "bedroom", "extraction_confidence": 0.9,
+         "polygon_points": pts((0.1, 0.1), (0.5, 0.1), (0.5, 0.5), (0.1, 0.5))},
+        {"room_type_code": "bathroom", "extraction_confidence": 0.8,
+         "polygon_points": pts((0.15, 0.15), (0.3, 0.15), (0.3, 0.3), (0.15, 0.3))},
+    ]
+    check("a bathroom inside a bedroom is left alone — different types",
+          len(dedupe(nested)) == 2)
+
 # ─── Result ───────────────────────────────────────────────────────────────────
 print("\n%d checks failed" % len(failures))
 if failures:
