@@ -45,7 +45,7 @@ def _grab(pattern, label):
     return m.group(0)
 
 
-env = {"math": math}
+env = {"math": math, "re": re}
 for pat, label in [
     (r"^def _ensure_clockwise\(.*?\n(?=\n\ndef |\n\n# )", "_ensure_clockwise"),
     (r"^def _assign_openings_to_nearest_wall\(.*?\n(?=\n\ndef |\n\n# )",
@@ -435,6 +435,51 @@ else:
     ]
     check("a bathroom inside a bedroom is left alone — different types",
           len(dedupe(nested)) == 2)
+
+# ─── 9. Room names vs dimensions, from the same live plan ────────────────────
+# Six of nine rooms were named after their own dimensions ("14'2x11'0"") because
+# the old filter stripped quotes and checked isdigit() — and the `x` survived
+# that strip. The picker then preferred the LONGEST candidate, and a printed
+# dimension is longer than "BEDROOM", so the wrong string won twice over.
+print("\n9. A dimension is never a room's name")
+
+for pat, dot in [
+    (r"^_QUOTE = [^\n]*$", False),
+    (r"^_DIM_PAIR_FT = re\.compile\(.*?\n\)", True),
+    (r"^_DIM_PAIR_MM = [^\n]*$", False),
+    (r"^def _parse_dimension_pair\(.*?\n(?=\n\ndef |\n\n# |\n\n@|\n\n[A-Z_]+ =)", True),
+    (r"^def _is_dimension_text\(.*?\n(?=\n\ndef |\n\n# |\n\n@|\n\n[A-Z_]+ =)", True),
+]:
+    m = re.search(pat, SRC, re.M | (re.S if dot else 0))
+    if not m:
+        print("  FAIL could not extract %s" % pat[:44])
+        failures.append("extract " + pat[:44])
+    else:
+        exec(m.group(0), env)
+
+is_dim = env["_is_dimension_text"]
+parse_pair = env["_parse_dimension_pair"]
+
+# Every one of these was stored as a room_label in production.
+for s in ["14'2x11'0\"", "13'6x10'6", "11'6x110", "9'0'x10'6\"", "5'6x7'8\"",
+          "5'0\"WIDE"]:
+    check("%-14r is recognised as a measurement" % s, is_dim(s))
+
+for s in ["M.BEDROOM", "LIVING", "BEDROOM", "TOILET", "KITCHEN",
+          "UTILITY 5'9\"WIDE"]:
+    check("%-18r is recognised as a name" % s, not is_dim(s))
+
+# The kitchen's own dimensions sat in the text beside it and were discarded,
+# because OCR read the inches mark as an apostrophe: 9'0' rather than 9'0".
+kitchen = parse_pair("9'0'x10'6\"")
+check("a stray apostrophe no longer costs a room its dimensions",
+      kitchen is not None and abs(kitchen[0] - 2743) < 2 and abs(kitchen[1] - 3200) < 2,
+      str(kitchen))
+check("a well-formed pair still parses",
+      parse_pair("14'2x11'0\"") is not None)
+check("a pair with an apostrophe dropped entirely is NOT guessed at",
+      parse_pair("11'6x110") is None,
+      "110 could be 11'0\" or 1'10\" — no dimension beats an invented one")
 
 # ─── Result ───────────────────────────────────────────────────────────────────
 print("\n%d checks failed" % len(failures))

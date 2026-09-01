@@ -561,10 +561,55 @@ def _pdf_to_raster_and_text(pdf_bytes: bytes):
 # because it is what the architect wrote rather than anything inferred from
 # pixels.
 
+# \u26a0\ufe0f THE QUOTE MARKS ARE WHATEVER OCR DECIDED THEY WERE, so both positions
+# accept any of them. This regex used to allow only a straight `"` for inches,
+# and required a straight `'` for feet \u2014 which cost a real room its dimensions:
+# a KITCHEN printed 9'0"x10'6" was READ correctly as `9'0'x10'6"` (OCR called the
+# inches mark an apostrophe), the pattern then met `'` where it wanted `x`, and
+# the whole pair was discarded. That room shipped with null length AND null
+# width while its own dimensions sat in the text beside it.
+# Feet and inches marks are deliberately the same permissive class: telling a
+# misread apostrophe from a misread double-quote is not possible here, and the
+# `x` between the two halves is what actually anchors the match.
+_QUOTE = "[\"'\u2019\u2018`\u00b4\u201d\u201c\u2033\u2032]"
 _DIM_PAIR_FT = re.compile(
-    "(\\d+)\\s*'\\s*(\\d+)?\\s*\"?\\s*[xX\u00d7]\\s*(\\d+)\\s*'\\s*(\\d+)?\\s*\"?"
+    "(\\d+)\\s*" + _QUOTE + "\\s*(\\d+)?\\s*" + _QUOTE + "?"
+    "\\s*[xX\u00d7]\\s*"
+    "(\\d+)\\s*" + _QUOTE + "\\s*(\\d+)?\\s*" + _QUOTE + "?"
 )
 _DIM_PAIR_MM = re.compile("(\\d{3,5})\\s*[xX\u00d7]\\s*(\\d{3,5})")
+
+
+def _is_dimension_text(text: str) -> bool:
+    """
+    True when a piece of OCR text is a measurement rather than a room's name.
+
+    ⚠️ THIS IS WHY ROOMS WERE NAMED "14'2x11'0"". The label picker used to reject
+    a candidate only if stripping `. , - ' "` left it all digits — and the `x` in
+    a dimension pair survives that strip, so `14'2x11'0"` came through as a
+    perfectly good room name. It then WON, because the picker preferred the
+    longest string and a printed dimension is longer than "BEDROOM". Measured on
+    a live plan 2026-09-01: six of nine rooms were named after their own
+    dimensions.
+
+    Two tests, because neither alone is enough:
+      • it parses as a dimension pair (the authoritative case), or
+      • stripping digits, quote marks, separators and the unit words leaves
+        nothing behind — which catches the malformed pairs OCR actually
+        produces, like `11'6x110` and `9'0'x10'6"`, that no pair regex matches.
+    """
+    s = (text or "").strip()
+    if not s:
+        return True
+    if _parse_dimension_pair(s):
+        return True
+    # Remove everything a measurement is made of; a room NAME leaves letters.
+    core = re.sub(r"[0-9\s'\"×xX.,\-–/]", "", s).upper()
+    if not core:
+        return True
+    # What survives on a dimension annotation is its unit word, not a name.
+    return core in {"WIDE", "MM", "M", "CM", "FT", "FEET", "IN", "INCH",
+                    "SQFT", "SQ", "SQM", "SFT", "DIA", "THK", "HT", "H", "W"}
 
 
 def _parse_dimension_pair(text: str):
@@ -2223,13 +2268,14 @@ def _step7_reconcile(rooms: list[dict], ocr_results: list[dict], scale_info: dic
             room["label_confidence"] = "low"
             continue
 
-        # Collect OCR text whose centroid falls inside the polygon
-        # Skip pure-number strings (those are dimensions, not labels)
+        # Collect OCR text whose centroid falls inside the polygon.
+        # A measurement is never a room's name - see _is_dimension_text for what
+        # this used to let through, and why the old digits-only test could not.
         label_candidates = [
-            r["text"] for r in ocr_results
+            r["text"].strip() for r in ocr_results
             if r["confidence"] > 0.65
-            and len(r["text"]) > 1
-            and not r["text"].replace(".", "").replace(",", "").replace("-", "").replace("'", "").replace('"', "").isdigit()
+            and len(r["text"].strip()) > 1
+            and not _is_dimension_text(r["text"])
             and (
                 poly.contains(Point(r["centroid"]["x"], r["centroid"]["y"]))
                 or poly.distance(Point(r["centroid"]["x"], r["centroid"]["y"])) < 0.015
@@ -2237,9 +2283,18 @@ def _step7_reconcile(rooms: list[dict], ocr_results: list[dict], scale_info: dic
         ]
 
         if label_candidates:
-            # Prefer longer strings (room names > single letters)
-            room["room_label"] = max(label_candidates, key=len)
-            room["label_confidence"] = "high"
+            # ⚠️ LONGEST IS A TIEBREAK, NOT THE RULE. It used to be the rule, and
+            # it is half of why rooms were named "14'2x11'0"" - a printed
+            # dimension is longer than "BEDROOM", so on any plan that labels its
+            # rooms with both, the measurement won. Dimensions are filtered out
+            # above now, but the preference still belongs on WORDS THE DRAWING
+            # USES FOR ROOMS: that is the same vocabulary the detection gate
+            # already trusts, so a label it recognises beats a longer stray
+            # string like a builder's watermark or a legend caption.
+            named = [t for t in label_candidates
+                     if any(w in t.upper() for w in ROOM_LABEL_WORDS)]
+            room["room_label"] = max(named or label_candidates, key=len)
+            room["label_confidence"] = "high" if named else "medium"
         else:
             room["room_label"] = room["room_type_code"].replace("_", " ").title()
             room["label_confidence"] = "low"  # fell back to room_type_code as label
