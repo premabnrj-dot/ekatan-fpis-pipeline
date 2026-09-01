@@ -1911,6 +1911,15 @@ def _step7_reconcile(rooms: list[dict], ocr_results: list[dict], scale_info: dic
         if val and 500 <= val <= 20000:
             dim_tokens.append({"mm": val, "centroid": region["centroid"]})
 
+    # Anything already carrying dimensions at this point read them off the
+    # drawing itself in Step 6 - that only happens on the Claude fallback path,
+    # which returns its own millimetres. Claim it now, so a room whose numbers
+    # nothing here improves still says where they came from. A printed pair
+    # found below outranks it and overwrites.
+    for room in rooms:
+        if room.get("length_mm") is not None or room.get("width_mm") is not None:
+            room.setdefault("dimension_source", "model_extraction")
+
     for room in rooms:
         poly_pts = room.get("polygon_points")
         if not poly_pts or len(poly_pts) < 3:
@@ -1952,10 +1961,19 @@ def _step7_reconcile(rooms: list[dict], ocr_results: list[dict], scale_info: dic
 
         inside_dims.sort(reverse=True)  # largest = length
 
+        # These are loose numbers lying inside or near the polygon, not a pair
+        # the architect wrote as this room's size. They are worth using and
+        # worth labelling as weaker - a designer deciding whether to re-measure
+        # needs to know which of the two they are looking at.
+        took_token = False
         if room.get("length_mm") is None and len(inside_dims) >= 1:
             room["length_mm"] = int(inside_dims[0])
+            took_token = True
         if room.get("width_mm") is None and len(inside_dims) >= 2:
             room["width_mm"] = int(inside_dims[1])
+            took_token = True
+        if took_token:
+            room["dimension_source"] = "ocr_tokens"
 
     # Enforce: length >= width
     for room in rooms:
@@ -1969,6 +1987,12 @@ def _step7_reconcile(rooms: list[dict], ocr_results: list[dict], scale_info: dic
         if room.get("dimension_confidence") is None:
             dims_found = (room.get("length_mm") is not None) + (room.get("width_mm") is not None)
             room["dimension_confidence"] = {2: "high", 1: "medium", 0: "low"}[dims_found]
+
+        # Say "none" rather than leaving the field absent. An absent key reads
+        # as "an older pipeline that never reported this"; "none" is the
+        # positive statement that we looked and found nothing.
+        if room.get("dimension_source") is None:
+            room["dimension_source"] = "none"
 
     # ── Assign room labels from OCR text inside each polygon ─────────────────
     # (Critical for Raster2Seq path: segmentation gives type but no label text)
