@@ -15,9 +15,22 @@ and means something else on Ekatan's. That defect has now happened three times.
      rescaled when the wall was - so a door detected mid-wall shipped claiming to
      sit ~150 mm from the corner of a 3,861 mm wall.
 
-Number 3 is what this file was written for. The rule it enforces is simple and
-worth stating plainly: **an opening and the wall it sits on must always be in the
-same unit, and that unit must be millimetres by the time the payload is built.**
+Number 3 is what this file was written for. The rule it enforced was simple:
+**an opening and the wall it sits on must always be in the same unit, and that
+unit must be millimetres by the time the payload is built.**
+
+⚠️ THAT RULE IS NOW ENFORCED BY HAVING NO OPENINGS. Extraction of doors and
+windows was removed on 2026-09-02 — the owner judged the data unreliable, and
+unreliable here is not cosmetic: an offset feeds `computeWallRun`, which measures
+the longest free stretch of a wall, which is what a wardrobe is priced against.
+Section 4 was rewritten to prove the payload carries none, and that every wall
+still carries the empty `openings` key. Sections 4b, 5 and 6 went with it.
+
+The name is kept. This file's remaining subject — winding, edge indices, wall
+positions, the private-key strip — is still exactly the contract that made
+opening offsets land correctly, and it is still what a reviewer's manually placed
+door depends on: `polygon_edge_index` binds a wall to its polygon edge, and a
+mirrored polygon sends every door a person places to the wrong end.
 
 Run:  python test_opening_geometry.py
 """
@@ -48,18 +61,14 @@ def _grab(pattern, label):
 env = {"math": math, "re": re}
 for pat, label in [
     (r"^def _ensure_clockwise\(.*?\n(?=\n\ndef |\n\n# )", "_ensure_clockwise"),
-    (r"^def _assign_openings_to_nearest_wall\(.*?\n(?=\n\ndef |\n\n# )",
-     "_assign_openings_to_nearest_wall"),
     (r"^def _r2s_walls_from_polygon\(.*?\n(?=\n\ndef |\n\n# )",
      "_r2s_walls_from_polygon"),
     (r"^def _rescale_walls_to_mm\(.*?\n(?=\n\ndef |\n\n# )", "_rescale_walls_to_mm"),
-    (r"^def _resolve_openings_to_mm\(.*?\n(?=\n\ndef |\n\n# )", "_resolve_openings_to_mm"),
 ]:
     exec(_grab(pat, label), env)
 
 ensure_clockwise = env["_ensure_clockwise"]
 walls_from_polygon = env["_r2s_walls_from_polygon"]
-assign_openings = env["_assign_openings_to_nearest_wall"]
 rescale = env["_rescale_walls_to_mm"]
 
 failures = []
@@ -79,13 +88,7 @@ def rect(x0, y0, x1, y1):
             {"x": x1, "y": y1}, {"x": x0, "y": y1}]
 
 
-def door_at(cx, cy, w_frac_x=0.04, w_frac_y=0.01, conf=0.9):
-    return {"opening_type": "single_door", "_cx": cx, "_cy": cy,
-            "_w_frac_x": w_frac_x, "_w_frac_y": w_frac_y,
-            "extraction_confidence": conf}
-
-
-def build_room(polygon, length_mm, width_mm, doors=()):
+def build_room(polygon, length_mm, width_mm):
     """Run the real Step 6 -> Step 7 path over one room."""
     poly = ensure_clockwise(polygon)
     room = {
@@ -95,8 +98,6 @@ def build_room(polygon, length_mm, width_mm, doors=()):
         "width_mm": width_mm,
         "walls": walls_from_polygon(poly),
     }
-    if doors:
-        assign_openings(list(doors), room["walls"])
     rescale([room])
     return room
 
@@ -180,138 +181,56 @@ check("an axis-aligned room still names its walls by compass",
       {w["wall_position"] for w in walls} == CARDINALS,
       str([w["wall_position"] for w in walls]))
 
-# ─── 4. THE ONE THAT MATTERS: openings land in millimetres ───────────────────
-print("\n4. Openings are millimetres on the same wall they sit on")
+# ─── 4. THIS PIPELINE EMITS NO OPENINGS ──────────────────────────────────────
+#
+# Sections 4, 4b, 5 and 6 used to prove that a detected door landed on the right
+# wall in the right unit. Opening extraction was removed on 2026-09-02 (owner:
+# the data was not reliable), so what needs proving inverted: the payload must
+# carry NO opening at all, and every wall must still carry the KEY.
+#
+# ⚠️ THE KEY MATTERS AS MUCH AS THE EMPTINESS. Ekatan reads `wall.openings ?? []`
+# so an absent key would not break it — which is exactly why dropping it would go
+# unnoticed until somebody assumed the pipeline had simply not been asked.
+#
+# ⚠️ AND AN EMPTY LIST IS NOT A DEGRADED ANSWER. An opening's offset feeds
+# `computeWallRun`, which measures the longest free stretch of a wall, which is
+# what a wardrobe is priced against. A door 300 mm out of place changes what
+# fits and nothing downstream can tell that from a correct one. Emitting nothing
+# removes a confident wrong answer; a reviewer supplies the right one.
+print("\n4. No openings leave this pipeline")
 
-# A 4,000 x 2,000 mm room drawn 0.40 x 0.20 of the image, door at the middle of
-# the north wall.
-room = build_room(rect(0.1, 0.1, 0.5, 0.3), 4000, 2000,
-                  doors=[door_at(0.30, 0.10)])
-north = [w for w in room["walls"] if w["wall_position"] == "north"][0]
-ops = all_openings(room)
+room = build_room(rect(0.1, 0.1, 0.5, 0.3), 4000, 2000)
+tall = build_room(rect(0.1, 0.1, 0.3, 0.6), 2000, 5000)
+blind = build_room(rect(0.1, 0.1, 0.5, 0.3), None, None)
 
-check("the door landed on the north wall", len(north.get("openings") or []) == 1)
-check("north wall measures the room's long side",
-      abs(north["wall_length_mm"] - 4000) <= 20, str(north["wall_length_mm"]))
+for label, r in (("a measured room", room), ("a tall room", tall),
+                 ("an unmeasurable room", blind)):
+    check("%s carries an openings key on every wall" % label,
+          all("openings" in w for w in r["walls"]),
+          str([sorted(w) for w in r["walls"]]))
+    check("%s carries no openings" % label,
+          all_openings(r) == [], str(all_openings(r)))
 
-door = ops[0]
-centre = door["offset_from_left_mm"] + door["rough_width_mm"] / 2.0
-check("a door at mid-wall reports its centre at mid-wall",
-      abs(centre - 2000) <= 60, "centre=%s" % centre)
-# The old bug: offset computed against the fraction x 10000 placeholder. A wall
-# of frac 0.40 became "4000", the door's centre landed near 2000 - and then the
-# wall was rescaled and the door was not. Where the two units coincide the test
-# must still fail on a wall whose scale is NOT 10000/unit, so check a second
-# room whose mm-per-fraction is deliberately different.
-tall = build_room(rect(0.1, 0.1, 0.5, 0.3), 12000, 6000,
-                  doors=[door_at(0.30, 0.10)])
-tall_north = [w for w in tall["walls"] if w["wall_position"] == "north"][0]
-tall_door = (tall_north.get("openings") or [None])[0]
-check("the same door in a 12 m room scales with the room, not with 10000",
-      tall_door is not None
-      and abs(tall_door["offset_from_left_mm"] + tall_door["rough_width_mm"] / 2.0
-              - 6000) <= 180,
-      "offset=%s width=%s" % (tall_door and tall_door["offset_from_left_mm"],
-                              tall_door and tall_door["rough_width_mm"]))
-
-check("the door is never wider than its own wall",
-      all(o["rough_width_mm"] <= w["wall_length_mm"]
-          for w in tall["walls"] for o in (w.get("openings") or [])))
-check("the door never hangs off the end of its wall",
-      all(o["offset_from_left_mm"] + o["rough_width_mm"] <= w["wall_length_mm"] + 1
-          for w in tall["walls"] for o in (w.get("openings") or [])))
-check("the door never starts before the wall does",
-      all(o["offset_from_left_mm"] >= 0
-          for w in tall["walls"] for o in (w.get("openings") or [])))
-
-# A door on a VERTICAL wall must be measured by its y-extent. Taking the
-# x-extent there reports the wall's THICKNESS as the door's width.
-# The two extents are chosen far apart on purpose: at 10,000 mm per fraction the
-# y-extent is a 900 mm door and the x-extent is an 80 mm sliver, so reading the
-# wrong axis cannot coincidentally land on the right answer.
-side = build_room(rect(0.1, 0.1, 0.5, 0.3), 4000, 2000,
-                  doors=[door_at(0.50, 0.20, w_frac_x=0.008, w_frac_y=0.09)])
-east = [w for w in side["walls"] if w["wall_position"] == "east"][0]
-east_door = (east.get("openings") or [None])[0]
-check("a door on a vertical wall is measured along that wall",
-      east_door is not None and abs(east_door["rough_width_mm"] - 900) <= 40,
-      "width=%s (80mm would mean the x-extent was used)"
-      % (east_door and east_door["rough_width_mm"]))
-
-# ─── 4b. Windows ride the same rails as doors ────────────────────────────────
-# Step 6b adds windows through the same assigner, so they must resolve to
-# millimetres identically. The floor differs by kind: flooring a ventilator at
-# 600 would silently double it.
-print("\n4b. Windows and ventilators")
-
-
-def window_at(cx, cy, w_frac_x=0.05, w_frac_y=0.0, kind="window_standard"):
-    return {"opening_type": kind, "_cx": cx, "_cy": cy,
-            "_w_frac_x": w_frac_x, "_w_frac_y": w_frac_y,
-            "extraction_confidence": 0.8}
-
-
-win = build_room(rect(0.1, 0.1, 0.5, 0.3), 4000, 2000,
-                 doors=[window_at(0.30, 0.10, w_frac_x=0.12)])
-win_op = all_openings(win)[0]
-check("a window is labelled W, not D", win_op["opening_label"].startswith("W"),
-      win_op["opening_label"])
-check("a window resolves to millimetres like a door",
-      abs(win_op["rough_width_mm"] - 1200) <= 40, str(win_op["rough_width_mm"]))
-
-# 0.02 of a 10,000 mm-per-fraction axis is 200 mm — under both floors, so this
-# separates the ventilator floor (300) from the default one (600).
-vent = build_room(rect(0.1, 0.1, 0.5, 0.3), 4000, 2000,
-                  doors=[window_at(0.30, 0.10, w_frac_x=0.02, kind="ventilator")])
-vent_op = all_openings(vent)[0]
-check("a narrow ventilator floors at 300mm, not 600mm",
-      vent_op["rough_width_mm"] == 300, str(vent_op["rough_width_mm"]))
-
-narrow = build_room(rect(0.1, 0.1, 0.5, 0.3), 4000, 2000,
-                    doors=[window_at(0.30, 0.10, w_frac_x=0.02)])
-check("a too-narrow window still floors at 600mm",
-      all_openings(narrow)[0]["rough_width_mm"] == 600,
-      str(all_openings(narrow)[0]["rough_width_mm"]))
-
-# ─── 5. Unknown scale produces nulls, never invented numbers ─────────────────
-# Ekatan reads a null offset as "unpositioned" and still draws the room
-# (room-shape.ts skips it, fpis-geometry.ts counts it as unpositionedMm). A
-# fabricated number would instead be priced.
-print("\n5. An unmeasurable room says so")
-
-blind = build_room(rect(0.1, 0.1, 0.5, 0.3), None, None,
-                   doors=[door_at(0.30, 0.10)])
-blind_ops = all_openings(blind)
-check("the room is flagged",
+# The flag still fires: a room whose dimensions never resolved must say so
+# rather than ship the `frac x 10000` placeholder as millimetres.
+check("an unmeasurable room is still flagged",
       "wall_lengths_unscaled:room_dimensions_unknown"
       in (blind.get("validation_flags") or []),
       str(blind.get("validation_flags")))
-check("openings report null width rather than a guess",
-      all(o["rough_width_mm"] is None for o in blind_ops))
-check("openings report null offset rather than a guess",
-      all(o["offset_from_left_mm"] is None for o in blind_ops))
+check("and its walls report null length rather than a guess",
+      all(w["wall_length_mm"] is None for w in blind["walls"]),
+      str([w["wall_length_mm"] for w in blind["walls"]]))
 
-# ─── 6. The Claude fallback path is left strictly alone ──────────────────────
-# It returns real millimetres in its own JSON. Rescaling those would be the
-# original bug wearing the other hat.
-print("\n6. Claude-supplied geometry is not touched")
-
-claude_room = {
-    "room_type_code": "kitchen",
-    "polygon_points": rect(0.1, 0.1, 0.4, 0.4),
-    "length_mm": 3000, "width_mm": 3000,
-    "walls": [{
-        "wall_position": "north", "wall_length_mm": 3000,
-        "openings": [{"opening_type": "single_door", "rough_width_mm": 900,
-                      "offset_from_left_mm": 300}],
-    }],
-}
-rescale([claude_room])
-w0 = claude_room["walls"][0]
-check("a Claude wall keeps its own millimetres", w0["wall_length_mm"] == 3000)
-check("a Claude opening keeps its own millimetres",
-      w0["openings"][0]["offset_from_left_mm"] == 300
-      and w0["openings"][0]["rough_width_mm"] == 900)
+# ⚠️ THE FALLBACK PROMPT'S OWN OPENINGS ARE DISCARDED TOO. The prompt tells the
+# model not to report any, but a prompt is a request; the sanitiser is the
+# guarantee. A model that volunteers a door must not be able to put it in a
+# quote.
+sanitize = None
+m = re.search(r"for wall in \(room\.get\(\"walls\"\) or \[\]\):\n"
+              r"\s+wall\[\"openings\"\] = \[\]", SRC)
+check("the Claude fallback forcibly empties every wall's openings",
+      m is not None,
+      "the sanitiser that discards volunteered openings is gone")
 
 # ─── 7. Nothing private escapes into the payload ─────────────────────────────
 # These keys are bookkeeping. Ekatan's Zod schema would not reject them (it
@@ -320,7 +239,7 @@ print("\n7. Internal bookkeeping is stripped")
 
 PRIVATE = ("_seg", "_frac_len", "_placeholder", "_axis", "_along_frac", "_width_frac")
 leaked = set()
-for r in (room, tall, side, blind):
+for r in (room, tall, blind):
     for w in r["walls"]:
         leaked |= {k for k in w if k in PRIVATE}
         for o in (w.get("openings") or []):

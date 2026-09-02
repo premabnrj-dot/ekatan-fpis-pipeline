@@ -39,11 +39,23 @@
 #                              printed labels; Claude Sonnet 4.6 is the FALLBACK
 #                              when the model is absent, errors, or disagrees
 #   7  Spatial Reconciliation — Shapely (link OCR dims → room polygons, then
-#                              resolve walls AND their openings into millimetres)
+#                              resolve walls into millimetres)
 #   8  Rules Engine          — Python (plausibility checks, confidence scoring)
 #   9  Webhook Callback      — HTTP POST to /api/fpis/callback
 #
+# ⚠️ THIS PIPELINE DOES NOT EXTRACT DOORS OR WINDOWS. It did until 2026-09-02,
+# via YOLO's one opening class and a separate Claude pass for windows; the owner
+# judged the result unreliable and it was removed rather than tuned. That is a
+# deliberate scope decision, not a gap waiting to be filled: an opening's offset
+# is fed straight into `computeWallRun`, which measures the longest free stretch
+# of a wall, which is what a wardrobe is sized and priced against. A door 300 mm
+# out of place changes what fits, and nothing downstream can tell a confident
+# wrong answer from a right one. Openings are placed by a reviewer on Ekatan's
+# FPIS review screen, where the outline, the dimensions and the scale already
+# come from. Every wall still ships `"openings": []`.
+#
 # Step 5 (MEP zone detection) was removed on 2026-09-01 — see _run_all_steps.
+# Step 6b (window detection) was removed on 2026-09-02 — see _run_all_steps.
 # The step numbers are deliberately NOT renumbered: they appear in production log
 # lines going back months, and renumbering would silently break that history.
 #
@@ -53,7 +65,6 @@
 #
 # Code conventions:
 #   Room type codes   — match room_types.code in Supabase (snake_case lowercase)
-#   Opening type codes — match opening_types.code in Supabase (snake_case lowercase)
 # =============================================================================
 
 from __future__ import annotations
@@ -213,12 +224,10 @@ VALID_ROOM_CODES = {
     "kids_room", "guest_room", "home_theatre", "powder_room", "master_bathroom",
 }
 
-VALID_OPENING_CODES = {
-    "single_door", "double_door", "sliding_door", "french_door",
-    "pocket_door", "window_standard", "window_bay", "window_corner",
-    "ventilator", "arched_opening", "niche_shallow", "niche_deep",
-    "exhaust_opening", "duct_access", "pass_through", "meter_box",
-}
+# VALID_OPENING_CODES — REMOVED 2026-09-02 with opening extraction. The
+# vocabulary still lives in Ekatan's `opening_types` table, which is where the
+# review screen's dropdown reads it from; this pipeline no longer names an
+# opening, so it no longer needs a copy of the list to validate against.
 
 # The seven codes NO CLASS PREDICTS — every one is reached only by
 # `_refine_room_code` reading the printed name, because each is identical in
@@ -234,8 +243,9 @@ REFINEMENT_ONLY_CODES = {
 WET_AREA_CODES = {"bathroom", "kitchen", "utility", "balcony",
                   "master_bathroom", "powder_room"}
 
-# Rooms exempt from the "zero openings" rule
-NO_OPENING_EXEMPT = {"passage", "staircase", "store"}
+# NO_OPENING_EXEMPT — REMOVED 2026-09-02 with Rule 6. It named the rooms a
+# missing door was not worth flagging for; with no detector, EVERY room has no
+# door and the rule could only fire on all of them at once.
 
 # Rooms excluded from carpet area total (external / non-habitable).
 # ⚠️ A UTILITY IS NOT EXTERNAL. It is the indoor work area beside the kitchen
@@ -431,14 +441,33 @@ def _run_all_steps(payload: dict) -> dict:
     )
     print(f"[Step 6] Raster2Seq extracted {len(rooms_raw)} rooms")
 
-    # ── Step 6b: Windows ──────────────────────────────────────────────────────
-    # Only on the YOLO path: the model has no window class, so without this a
-    # plan ships with doors and nothing else. The Claude fallback already
-    # returns windows in its own geometry, and asking twice would double them.
-    if _rooms_came_from_yolo(rooms_raw):
-        rooms_raw = _step6b_windows_detect.remote(processed_bytes, rooms_raw)
-    else:
-        print("[Step 6b] Skipped - the Claude fallback already returns windows")
+    # ── Step 6b: Windows — REMOVED 2026-09-02 ─────────────────────────────────
+    #
+    # ⚠️ THIS PIPELINE NO LONGER EXTRACTS DOORS OR WINDOWS AT ALL, by owner
+    # decision: "opening data from the fpis extraction modal pipeline is not
+    # reliable. we can possibly remove that from the pipeline?"
+    #
+    # ⚠️ AND UNRELIABLE OPENINGS ARE NOT A COSMETIC PROBLEM — they cost money in
+    # the expensive direction. Ekatan's `computeWallRun` measures the longest
+    # uninterrupted stretch of a wall from exactly these offsets, and that
+    # stretch is what a wardrobe or a kitchen line is then sized and priced
+    # against. A door detected 300 mm from where it really is changes what fits;
+    # a window invented on a wall shortens a run that was never interrupted.
+    # Emitting nothing is not a loss of information, it is the removal of a
+    # confident wrong answer.
+    #
+    # Every wall still ships `"openings": []`. The key stays so the payload's
+    # shape is unchanged and Ekatan's reader needs no edit — an absent key and an
+    # empty list are the same to `wall.openings ?? []`, but the empty list says
+    # "none found" deliberately rather than "this pipeline forgot".
+    #
+    # Openings are now placed by a reviewer on the FPIS review screen, which is
+    # where the outline, the dimensions and the scale already come from
+    # (ADR-176). What replaces the detector is a person looking at the drawing.
+    #
+    # ⚠️ REMOVING THIS BREAKS NO OTHER COMPUTATION HERE. Openings were produced,
+    # validated and emitted; nothing in this file read them to derive adjacency,
+    # wall segmentation, area or a room dimension. Verified before cutting.
 
     # ── Step 7: Spatial Reconciliation ────────────────────────────────────────
     rooms_reconciled = _step7_reconcile(rooms_raw, ocr_results, scale_info)
@@ -1033,7 +1062,10 @@ YOLO_ROOM_TO_CODE = {
     "29-walkin":         "walk_in_wardrobe",
 }
 
-YOLO_DOOR_CLASS      = "15-door"
+# YOLO_DOOR_CLASS ("15-door") — REMOVED 2026-09-02. It was the model's only
+# opening class, and the sole reason this pipeline could claim to find a door at
+# all. Detections on that class are now ignored along with every other class the
+# room map does not name.
 YOLO_WEIGHTS_PATH    = "/models/floor_plan_indian_best.pt"
 YOLO_MIN_CONF        = 0.30
 YOLO_MIN_AREA_FRAC   = 0.004
@@ -1368,21 +1400,6 @@ def _rescue_code_from_label(joined: str) -> str | None:
     return hits.pop() if len(hits) == 1 else None
 
 
-def _fractional_polygon_area(polygon_points: list[dict]) -> float:
-    """Shoelace area of a fractional polygon. Used to pick the SMALLEST room
-    containing a door, so a door inside a bedroom that also falls inside a
-    larger overlapping detection is credited to the bedroom."""
-    n = len(polygon_points)
-    if n < 3:
-        return 0.0
-    total = 0.0
-    for i in range(n):
-        a = polygon_points[i]
-        b = polygon_points[(i + 1) % n]
-        total += a["x"] * b["y"] - b["x"] * a["y"]
-    return abs(total) / 2.0
-
-
 def _boxify(polygon_points: list[dict]) -> list[dict]:
     """The axis-aligned bounding box of a polygon, wound clockwise from top-left."""
     xs = [p["x"] for p in polygon_points]
@@ -1593,7 +1610,7 @@ def _dedupe_overlapping_rooms(rooms: list[dict]) -> list[dict]:
 
     Only same-typed rooms are compared. Two DIFFERENT room types overlapping is
     ordinary and must not be touched - a bathroom's box legitimately sits inside
-    a bedroom's, and the door assigner already relies on that nesting.
+    a bedroom's.
     """
     if len(rooms) < 2:
         return rooms
@@ -1649,13 +1666,19 @@ def _ensure_clockwise(polygon_points: list[dict]) -> list[dict]:
     """
     Wind a fractional polygon clockwise as seen on the page, reversing if not.
 
-    ⚠️ THIS IS A CONTRACT WITH EKATAN, NOT A TIDINESS RULE. `offset_from_left_mm`
-    is measured from a wall's START vertex, and which end that is depends
-    entirely on the winding direction. Ekatan builds its own walls "clockwise
-    from top-left in y-down space" (src/domains/plan-graph/conversion.ts) - so
-    north runs left-to-right, east top-to-bottom, south right-to-left, west
-    bottom-to-top. Hand it a counter-clockwise polygon and every opening is
-    mirrored to the wrong end of every wall, consistently and invisibly.
+    ⚠️ THIS IS A CONTRACT WITH EKATAN, NOT A TIDINESS RULE, AND REMOVING OPENING
+    EXTRACTION DID NOT WEAKEN IT. `offset_from_left_mm` is measured from a wall's
+    START vertex, and which end that is depends entirely on the winding
+    direction. Ekatan builds its own walls "clockwise from top-left in y-down
+    space" (src/domains/plan-graph/conversion.ts) - so north runs left-to-right,
+    east top-to-bottom, south right-to-left, west bottom-to-top. Hand it a
+    counter-clockwise polygon and every opening is mirrored to the wrong end of
+    every wall, consistently and invisibly.
+
+    That the openings are now placed by a REVIEWER makes this MORE load-bearing,
+    not less: `polygon_edge_index` binds each wall to the polygon edge it came
+    from, and the review screen positions a door against that edge. A polygon
+    wound the wrong way sends every door a person places to the wrong end.
 
     `_rectify_contour`'s bounding-box branch already emits clockwise, but the
     irregular branch inherits the winding of the YOLO mask contour, which is not
@@ -1676,79 +1699,12 @@ def _ensure_clockwise(polygon_points: list[dict]) -> list[dict]:
     return polygon_points if signed >= 0 else list(reversed(polygon_points))
 
 
-def _assign_openings_to_nearest_wall(openings: list[dict], walls: list[dict]) -> None:
-    """
-    Put each opening on the wall whose segment it is actually closest to.
-
-    ⚠️ THE FUNCTION THIS REPLACES WAS BROKEN. `_r2s_assign_openings_to_walls`
-    computed `dist = abs(cx_frac - 0.5) + abs(cy_frac - 0.5)`, which does not
-    reference `wall` at all - the value was identical for every wall, so
-    `dist < best_dist` was true only on the first iteration and EVERY opening
-    in a room landed on wall #1. It never fired in production because the model
-    weights were missing, but it would have the moment they arrived.
-
-    Walls carry their own segment endpoints here (_seg), stripped before the
-    payload leaves this module.
-
-    ⚠️ NOTHING HERE IS IN MILLIMETRES, AND THAT IS THE POINT. At Step 6 a wall
-    is still a fraction of the image (`_frac_len`), so an offset computed now
-    would be a fraction dressed up as mm. It used to be exactly that: this
-    function wrote `best_t * wall_length_mm` while `wall_length_mm` was the
-    `frac x 10000` placeholder, and `_rescale_walls_to_mm` later converted the
-    WALL to real mm and left the OPENING behind. The two then sat on the same
-    object in different units - a door at mid-wall rendered hard against the
-    left corner, and Ekatan's `fpis-geometry.ts` fed that offset into the span
-    maths that sizes a wardrobe on a quote.
-    So we record WHERE ALONG THE WALL the opening sits (0-1) and how wide it is
-    as a fraction of the image on each axis, and let `_rescale_walls_to_mm`
-    turn all three into millimetres in one place, once, when the room's true
-    size is known.
-    """
-    for op in openings:
-        # ⚠️ READ, NEVER POP. This used to `op.pop("_cx")`, which mutated a dict
-        # shared with the caller's candidate list. A door whose centroid falls
-        # inside two overlapping room polygons is visited twice, and the second
-        # visit died with KeyError: '_cx' - caught on a live run against a real
-        # builder plan on 2026-08-28, and missed by the unit test because that
-        # test copied the dicts before calling. Each door is now assigned to
-        # exactly one room by the caller, but this stays non-destructive so the
-        # function is safe to call more than once regardless.
-        cx, cy = op.get("_cx"), op.get("_cy")
-        if cx is None or cy is None:
-            continue
-        best, best_d, best_t = None, float("inf"), 0.0
-        for wall in walls:
-            seg = wall.get("_seg")
-            if not seg:
-                continue
-            (x0, y0), (x1, y1) = seg
-            dx, dy = x1 - x0, y1 - y0
-            L2 = dx * dx + dy * dy
-            if L2 <= 1e-12:
-                continue
-            t = max(0.0, min(1.0, ((cx - x0) * dx + (cy - y0) * dy) / L2))
-            px, py = x0 + t * dx, y0 + t * dy
-            d = math.hypot(cx - px, cy - py)
-            if d < best_d:
-                best, best_d, best_t = wall, d, t
-        if best is None:
-            continue
-        is_door = str(op.get("opening_type", "")).endswith("door")
-        # Measure the opening along the wall it landed on, not along the image.
-        # A door on a vertical wall is WIDE in y and thin in x; taking the
-        # x-extent for it would report the wall's thickness as the door's width.
-        axis = best.get("_axis")
-        width_frac = op.get("_w_frac_y") if axis == "v" else op.get("_w_frac_x")
-        best["openings"].append({
-            "opening_type":          op["opening_type"],
-            "opening_label":         f"{'D' if is_door else 'W'}{len(best['openings']) + 1}",
-            # Resolved by _rescale_walls_to_mm, together with the wall itself.
-            "rough_width_mm":        None,
-            "offset_from_left_mm":   None,
-            "extraction_confidence": op["extraction_confidence"],
-            "_along_frac":           best_t,
-            "_width_frac":           width_frac,
-        })
+# `_assign_openings_to_nearest_wall` — REMOVED 2026-09-02 with opening
+# extraction. It put each detected opening on the wall segment it was actually
+# closest to, having replaced an earlier version whose distance calculation did
+# not reference the wall at all and so landed every opening in a room on wall #1.
+# That bug is worth remembering: it never fired in production only because the
+# model weights were missing, and it would have the moment they arrived.
 
 
 # ─── Step 6: Room Extraction — YOLO26n-seg (Indian plans) ─────────────────────
@@ -1812,7 +1768,6 @@ def _step6_raster2seq_extract(
                                       bedroom_count, property_type)
 
     rooms: list[dict] = []
-    door_candidates: list[dict] = []
     rejected: list[str] = []
 
     # PASS 1 — collect the furniture. It has to happen before any room is
@@ -1827,25 +1782,11 @@ def _step6_raster2seq_extract(
     print(f"[Step 6] {len(furniture_xy)} furniture detection(s) available to "
           f"repair room outlines")
 
-    # PASS 2 — rooms and doors.
+    # PASS 2 — rooms. Doors were collected here until 2026-09-02; see the note
+    # at Step 6b for why this pipeline no longer names an opening.
     for box, mask_xy in zip(result.boxes, result.masks.xy):
         name = names[int(box.cls[0])]
         conf = float(box.conf[0])
-
-        if name == YOLO_DOOR_CLASS and conf >= YOLO_MIN_CONF:
-            xs, ys = mask_xy[:, 0], mask_xy[:, 1]
-            door_candidates.append({
-                "opening_type":          "single_door",
-                "_cx":                   float(xs.mean()) / W,
-                "_cy":                   float(ys.mean()) / H,
-                # Both axes: the assigner picks whichever runs ALONG the wall
-                # this door ends up on. Keeping only the x-extent reported a
-                # vertical door's width as the wall's thickness.
-                "_w_frac_x":             float(xs.max() - xs.min()) / W,
-                "_w_frac_y":             float(ys.max() - ys.min()) / H,
-                "extraction_confidence": round(conf, 3),
-            })
-            continue
 
         code = YOLO_ROOM_TO_CODE.get(name)
         if code is None or conf < YOLO_MIN_CONF:
@@ -1931,34 +1872,6 @@ def _step6_raster2seq_extract(
         return _step6_claude_fallback(image_bytes, ocr_results, scale_info,
                                       bedroom_count, property_type)
 
-    if door_candidates:
-        # Each door belongs to exactly ONE room - the smallest polygon that
-        # contains it. Detections overlap (a bathroom sits inside a bedroom's
-        # box often enough), and assigning the same door to both rooms both
-        # double-counts openings and re-enters the assigner on a dict it has
-        # already consumed.
-        for door in door_candidates:
-            containing = [
-                r for r in rooms
-                if _point_in_fractional_polygon(r["polygon_points"], door["_cx"], door["_cy"])
-            ]
-            door["_room_index"] = (
-                min(range(len(rooms)),
-                    key=lambda i: _fractional_polygon_area(rooms[i]["polygon_points"])
-                    if rooms[i] in containing else float("inf"))
-                if containing else None
-            )
-
-        for idx, room in enumerate(rooms):
-            mine = [d for d in door_candidates if d.get("_room_index") == idx]
-            if mine:
-                _assign_openings_to_nearest_wall(mine, room["walls"])
-
-    # Segment endpoints were an implementation detail of door assignment.
-    for room in rooms:
-        for wall in room["walls"]:
-            wall.pop("_seg", None)
-
     # Last line of defence. Rectification should already have kept every
     # polygon under the cap, but a room that arrives here with more walls than
     # Ekatan will accept would fail the WHOLE payload, not just itself - so the
@@ -1972,8 +1885,7 @@ def _step6_raster2seq_extract(
                   f"{before} -> {len(room['walls'])} (callback caps at "
                   f"{MAX_ROOM_POLYGON_VERTS})")
 
-    print(f"[Step 6] YOLO produced {len(rooms)} gated rooms, "
-          f"{len(door_candidates)} doors")
+    print(f"[Step 6] YOLO produced {len(rooms)} gated rooms")
     return rooms
 
 
@@ -2062,10 +1974,11 @@ def _r2s_walls_from_polygon(polygon_points: list[dict]) -> list[dict]:
             "_frac_len":      length_frac,
             "_axis":          axis,
             "_placeholder":   True,
+            # ⚠️ ALWAYS EMPTY SINCE 2026-09-02, AND THE KEY STAYS. This pipeline
+            # no longer detects doors or windows; a reviewer places them. Keeping
+            # the key means Ekatan's reader is unchanged, and an explicit empty
+            # list says "none found" rather than "this pipeline forgot".
             "openings":       [],
-            # Kept only long enough for _assign_openings_to_nearest_wall to
-            # measure real distances; stripped before the payload is built.
-            "_seg":           ((p1["x"], p1["y"]), (p2["x"], p2["y"])),
         })
     return walls
 
@@ -2108,9 +2021,6 @@ TASK: Extract every room from this floor plan.
 Valid room_type_code values (use EXACTLY these strings):
 {json.dumps(sorted(VALID_ROOM_CODES))}
 
-Valid opening_type values (use EXACTLY these strings):
-{json.dumps(sorted(VALID_OPENING_CODES))}
-
 Room label guidance:
 - "Master Bedroom", "M. Bed", "MBR"              → master_bedroom
 - "Bedroom", "Bed Room", "BR"                    → bedroom
@@ -2137,6 +2047,9 @@ Room label guidance:
 
 Convert ALL dimensions to MILLIMETRES. If unreadable, set null — never invent.
 
+Do NOT report doors, windows or any other opening. They are recorded by a person
+reviewing this drawing, and a guess here would be treated as a measurement.
+
 Output JSON array only. polygon_points are fractional (0.0–1.0), clockwise, min 4 points.
 [
   {{
@@ -2148,10 +2061,10 @@ Output JSON array only. polygon_points are fractional (0.0–1.0), clockwise, mi
     "sort_order": 1,
     "polygon_points": [{{"x": 0.10, "y": 0.15}}, {{"x": 0.35, "y": 0.15}}, {{"x": 0.35, "y": 0.40}}, {{"x": 0.10, "y": 0.40}}],
     "walls": [
-      {{"wall_position": "north", "wall_length_mm": 4500, "openings": [{{"opening_type": "single_door", "rough_width_mm": 900, "offset_from_left_mm": 300, "door_swing": "inward_right", "extraction_confidence": 0.88}}]}},
-      {{"wall_position": "east",  "wall_length_mm": 3600, "openings": [{{"opening_type": "window_standard", "rough_width_mm": 1200, "offset_from_left_mm": 600}}]}},
-      {{"wall_position": "south", "wall_length_mm": 4500, "openings": []}},
-      {{"wall_position": "west",  "wall_length_mm": 3600, "openings": []}}
+      {{"wall_position": "north", "wall_length_mm": 4500}},
+      {{"wall_position": "east",  "wall_length_mm": 3600}},
+      {{"wall_position": "south", "wall_length_mm": 4500}},
+      {{"wall_position": "west",  "wall_length_mm": 3600}}
     ]
   }}
 ]"""
@@ -2193,180 +2106,28 @@ Output JSON array only. polygon_points are fractional (0.0–1.0), clockwise, mi
                 room["polygon_points"] = _ensure_clockwise(pts)
             except (KeyError, TypeError):
                 pass   # malformed points: leave them, the rules engine will flag
+        # ⚠️ EVERY WALL IS FORCED TO NO OPENINGS, even if the model volunteers
+        # some. The prompt above tells it not to, but a prompt is a request and
+        # this is the guarantee: a model that ignores the instruction must not be
+        # able to put a fabricated door into a quote. Cheaper than trusting the
+        # instruction and cheaper than validating what comes back.
         for wall in (room.get("walls") or []):
-            for opening in (wall.get("openings") or []):
-                if opening.get("opening_type") not in VALID_OPENING_CODES:
-                    opening["opening_type"] = "single_door"
+            wall["openings"] = []
 
     return [r for r in rooms_raw if isinstance(r, dict)]
 
 
-# ─── Step 6b: Windows ─────────────────────────────────────────────────────────
+# ─── Step 6b: Windows — REMOVED 2026-09-02 ────────────────────────────────────
 #
-# WHY A SEPARATE PASS, AND WHY CLAUDE. The segmentation model has 31 classes and
-# exactly one of them is an opening: `15-door`. There is no window class, so on
-# the YOLO path a window could not be detected at all — every room shipped with
-# doors only, and Rule 6 then flagged the room for the missing openings it was
-# never able to find.
+# A separate Claude pass that asked one question — where are the windows — and
+# existed because the segmentation model has 31 classes and exactly one of them
+# is an opening (`15-door`), so a window could not be detected at all on the YOLO
+# path. It ran only on that path; the fallback prompt returned windows with the
+# rest of its geometry, and asking twice would have doubled them.
 #
-# This is deliberately the NARROWEST possible use of a model: it is asked for
-# windows and nothing else. Doors stay with YOLO, which is trained and measured
-# on them (mAP50 0.868). One source per opening kind means there is nothing to
-# de-duplicate and no arbitration to get wrong.
-#
-# It does NOT run on the Claude fallback path — that prompt already returns
-# windows with the rest of its geometry, and asking twice would double them.
-#
-# The output feeds the same assigner and the same rescaling as doors, so a
-# window cannot end up in different units from the wall it sits on.
-
-WINDOW_OPENING_CODES = ("window_standard", "window_bay", "window_corner", "ventilator")
-
-
-def _rooms_came_from_yolo(rooms: list[dict]) -> bool:
-    """
-    True when Step 6 produced these rooms from the segmentation model.
-
-    The tell is `_placeholder`: `_r2s_walls_from_polygon` stamps it on every wall
-    it derives from a polygon, and the Claude fallback returns walls carrying
-    real millimetres with no such marker. Step 7 already relies on exactly this
-    distinction to decide which walls it owns.
-    """
-    return any(
-        w.get("_placeholder")
-        for r in rooms
-        for w in (r.get("walls") or [])
-    )
-
-
-@app.function(image=cpu_image, secrets=[fpis_secrets], timeout=180, memory=1024)
-def _step6b_windows_detect(image_bytes: bytes, rooms: list[dict]) -> list[dict]:
-    """
-    Find windows and add them to the rooms Step 6 already found.
-
-    Returns the rooms, mutated. On any failure it returns them untouched: a
-    plan with doors and no windows is a smaller loss than a failed extraction.
-    """
-    if not rooms:
-        return rooms
-
-    try:
-        client = _get_claude()
-        b64, mime = _image_for_claude(image_bytes)
-
-        prompt = f"""You are reading an Indian residential floor plan to locate its WINDOWS.
-
-Find every window, ventilator and similar wall opening that is NOT a door.
-Ignore doors entirely — those are already known.
-
-A window is drawn as a break in a wall, usually with thin parallel lines across
-the gap. It sits ON a wall line, never in open floor space.
-
-For each one give the two endpoints where it meets the wall, as fractions of the
-image (0.0-1.0, x from left, y from top). The line from (x1,y1) to (x2,y2) must
-run ALONG the wall, so a window on a vertical wall has x1 approximately equal to x2.
-
-Valid opening_type values (use EXACTLY these strings):
-{json.dumps(list(WINDOW_OPENING_CODES))}
-  window_standard - an ordinary window
-  window_bay      - a window that projects out of the wall
-  window_corner   - a window wrapping a corner
-  ventilator      - a small high vent, common above bathroom doors
-
-Return a JSON array only, no markdown. Return [] if you find none.
-Do not guess: a window you are unsure about is better left out.
-[
-  {{"opening_type": "window_standard", "x1": 0.21, "y1": 0.14, "x2": 0.29, "y2": 0.14, "confidence": 0.9}},
-  {{"opening_type": "ventilator",      "x1": 0.55, "y1": 0.40, "x2": 0.55, "y2": 0.44, "confidence": 0.7}}
-]"""
-
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image",
-                     "source": {"type": "base64", "media_type": mime, "data": b64}},
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-        )
-        found = _parse_json_response(response.content[0].text, [])
-    except Exception as exc:
-        print(f"[Step 6b] Window detection failed: {exc} - continuing with doors only")
-        return rooms
-
-    if not isinstance(found, list) or not found:
-        print("[Step 6b] No windows found")
-        return rooms
-
-    # Rebuild each wall's segment from the polygon. Step 6 strips `_seg` before
-    # returning, and `polygon_edge_index` is what makes this recoverable —
-    # walls[i] is NOT polygon_points[i] once short edges are skipped.
-    for room in rooms:
-        pts = room.get("polygon_points") or []
-        n = len(pts)
-        for wall in (room.get("walls") or []):
-            i = wall.get("polygon_edge_index")
-            if isinstance(i, int) and 0 <= i < n:
-                a, b = pts[i], pts[(i + 1) % n]
-                wall["_seg"] = ((a["x"], a["y"]), (b["x"], b["y"]))
-
-    candidates = []
-    for w in found[:40]:
-        if not isinstance(w, dict):
-            continue
-        code = w.get("opening_type")
-        if code not in WINDOW_OPENING_CODES:
-            code = "window_standard"
-        try:
-            x1, y1 = float(w["x1"]), float(w["y1"])
-            x2, y2 = float(w["x2"]), float(w["y2"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if not all(0.0 <= v <= 1.0 for v in (x1, y1, x2, y2)):
-            continue
-        candidates.append({
-            "opening_type":          code,
-            "_cx":                   (x1 + x2) / 2.0,
-            "_cy":                   (y1 + y2) / 2.0,
-            "_w_frac_x":             abs(x2 - x1),
-            "_w_frac_y":             abs(y2 - y1),
-            "extraction_confidence": round(float(w.get("confidence") or 0.7), 3),
-        })
-
-    # A window sits ON a boundary, so containment cannot place it the way it
-    # places a door. Give it to the room whose nearest wall it is actually
-    # closest to, and only if it is close enough to be on that wall at all.
-    MAX_WALL_DISTANCE_FRAC = 0.03
-    placed = 0
-    for cand in candidates:
-        best_room, best_d = None, float("inf")
-        for room in rooms:
-            for wall in (room.get("walls") or []):
-                seg = wall.get("_seg")
-                if not seg:
-                    continue
-                (x0, y0), (x1, y1) = seg
-                dx, dy = x1 - x0, y1 - y0
-                L2 = dx * dx + dy * dy
-                if L2 <= 1e-12:
-                    continue
-                t = max(0.0, min(1.0, ((cand["_cx"] - x0) * dx + (cand["_cy"] - y0) * dy) / L2))
-                d = math.hypot(cand["_cx"] - (x0 + t * dx), cand["_cy"] - (y0 + t * dy))
-                if d < best_d:
-                    best_room, best_d = room, d
-        if best_room is not None and best_d <= MAX_WALL_DISTANCE_FRAC:
-            _assign_openings_to_nearest_wall([cand], best_room["walls"])
-            placed += 1
-
-    for room in rooms:
-        for wall in (room.get("walls") or []):
-            wall.pop("_seg", None)
-
-    print(f"[Step 6b] Claude found {len(candidates)} window(s), placed {placed} on walls")
-    return rooms
+# Removed with the rest of opening extraction. `_rooms_came_from_yolo`, the
+# `_placeholder` test that decided which path a room came from, went with it —
+# `_rescale_walls_to_mm` still relies on that same flag, but reads it directly.
 
 
 # ─── Step 7: Spatial Reconciliation ───────────────────────────────────────────
@@ -2738,15 +2499,16 @@ def _rescale_walls_to_mm(rooms: list[dict]) -> None:
     A room whose dimensions are still unknown keeps its placeholder and is
     flagged, rather than being silently handed a fabricated number.
 
-    THE OPENINGS ARE RESOLVED HERE TOO, and they must be. They were not, and
-    that was a bug with a straight line to a customer's quote: Step 6 wrote
-    `offset_from_left_mm` against the fraction placeholder, this function
-    converted the WALL and not the OPENING, and the two shipped in different
-    units on the same object. A door detected mid-wall arrived at Ekatan
-    claiming to sit ~150 mm from the corner of a 3,861 mm wall. `room-shape.ts`
-    clamps that offset against the wall run, `fpis-geometry.ts` turns it into
-    the spans that size a wardrobe, and the 3D portal draws it - three
-    consumers, all of them wrong, none of them able to notice.
+    THE OPENINGS WERE RESOLVED HERE TOO, until opening extraction was removed on
+    2026-09-02. Kept as a note because the bug it fixed has a straight line to a
+    customer's quote and would return the moment anything here emits an opening
+    again: Step 6 wrote `offset_from_left_mm` against the fraction placeholder,
+    this function converted the WALL and not the OPENING, and the two shipped in
+    different units on the same object. A door detected mid-wall arrived at
+    Ekatan claiming to sit ~150 mm from the corner of a 3,861 mm wall.
+    `room-shape.ts` clamps that offset against the wall run, `fpis-geometry.ts`
+    turns it into the spans that size a wardrobe, and the 3D portal draws it -
+    three consumers, all of them wrong, none of them able to notice.
     """
     for room in rooms:
         walls = room.get("walls") or []
@@ -2783,7 +2545,6 @@ def _rescale_walls_to_mm(rooms: list[dict]) -> None:
                         scale = math.sqrt(mm_per_x * mm_per_y)
                     wall["wall_length_mm"] = int(round(frac * scale))
                     wall["_placeholder"] = False
-                    _resolve_openings_to_mm(wall, scale)
                 continue
 
         # No usable dimensions: say so rather than invent a length.
@@ -2805,68 +2566,32 @@ def _rescale_walls_to_mm(rooms: list[dict]) -> None:
         # fabricated number costs a wardrobe sized against the image.
         for wall in placeholder:
             wall["wall_length_mm"] = None
-            for op in wall.get("openings") or []:
-                if "_along_frac" in op:
-                    op["rough_width_mm"] = None
-                    op["offset_from_left_mm"] = None
         room.setdefault("validation_flags", []).append(
             "wall_lengths_unscaled:room_dimensions_unknown"
         )
 
     # Strip the bookkeeping before the payload is built.
+    #
+    # ⚠️ EVERY WALL LEAVES WITH AN EMPTY `openings` LIST since 2026-09-02, and
+    # this asserts it rather than assuming it. Both producers set it — the
+    # polygon builder and the fallback's sanitiser — but this is the last place
+    # anything looks at a wall before it becomes a payload, and a key that must
+    # be true of the output is cheapest to guarantee where the output is made.
     for room in rooms:
         for wall in room.get("walls") or []:
             wall.pop("_frac_len", None)
             wall.pop("_placeholder", None)
             wall.pop("_axis", None)
-            wall.pop("_seg", None)
-            for op in wall.get("openings") or []:
-                op.pop("_along_frac", None)
-                op.pop("_width_frac", None)
+            wall["openings"] = []
 
 
-def _resolve_openings_to_mm(wall: dict, scale: float) -> None:
-    """
-    Turn one wall's fractional openings into millimetres along that wall.
-
-    `scale` is the same millimetres-per-fraction the wall itself was just
-    measured with, so the opening and the wall it sits on can never again be
-    expressed in different units.
-
-    Only openings carrying `_along_frac` are touched: the Claude fallback path
-    returns real millimetres in its own JSON and must be left exactly alone.
-    """
-    wall_mm = wall.get("wall_length_mm") or 0
-    for op in wall.get("openings") or []:
-        if "_along_frac" not in op:
-            continue
-
-        width_frac = op.get("_width_frac")
-        width_mm = int(round(width_frac * scale)) if width_frac else 0
-        # A detection narrower than the narrowest real opening of its kind is an
-        # artefact, not a measurement. The floors come from the widths Ekatan
-        # seeds in opening_types.min_clear_width_mm: a ventilator starts at 300,
-        # an exhaust at 150, a single door at 700, a standard window at 600.
-        # Flooring everything at 600 would have quietly doubled every ventilator.
-        kind = str(op.get("opening_type", ""))
-        floor_mm = 300 if kind in ("ventilator", "exhaust_opening") else 600
-        if width_mm < floor_mm:
-            width_mm = floor_mm
-        if wall_mm > 0:
-            width_mm = min(width_mm, wall_mm)
-
-        # `_along_frac` is where the opening's CENTRE sits along the wall, 0 at
-        # the wall's start vertex. Ekatan measures `offset_from_left_mm` from
-        # that same start (plan-graph/conversion.ts winds every room clockwise
-        # from the top-left), so the two agree as long as the polygon does.
-        centre_mm = (op.get("_along_frac") or 0.0) * wall_mm
-        offset = int(round(centre_mm - width_mm / 2.0))
-        # Keep the opening on its own wall: Ekatan clamps this anyway
-        # (room-shape.ts), but a negative offset would be stored as-is.
-        offset = max(0, min(offset, max(0, wall_mm - width_mm)))
-
-        op["rough_width_mm"] = width_mm
-        op["offset_from_left_mm"] = offset
+# `_resolve_openings_to_mm` — REMOVED 2026-09-02 with opening extraction. It
+# converted a wall's fractional openings into millimetres using the same
+# millimetres-per-fraction the wall itself had just been measured with, so that
+# an opening and the wall it sat on could never again be expressed in different
+# units. That defect is worth remembering: an earlier version multiplied by
+# `wall_length_mm` while that still held the `frac x 10000` placeholder, and a
+# door at mid-wall rendered hard against the left corner.
 
 
 # ─── Step 8: Rules Engine ─────────────────────────────────────────────────────
@@ -2922,24 +2647,21 @@ def _step8_rules_engine(rooms: list[dict], carpet_area_sqft: float | None) -> li
             flags.append("both_dimensions_null:cost_engine_blocked")
             needs_review = True
 
-        # Rule 6 — Opening count sanity.
-        # ⚠️ DOORS ONLY, ON PURPOSE. A habitable room with no door found is a
-        # real miss worth a human's time. A room with no WINDOW found is not
-        # evidence of anything: the segmentation model has no window class at
-        # all (its only opening class is `15-door`), so windows arrive only from
-        # the Claude fallback or the openings pass. Counting all openings here
-        # flagged nearly every room on every YOLO run and docked 0.15 off its
-        # confidence for a gap in the model's vocabulary rather than a defect in
-        # the plan.
-        door_count = sum(
-            1
-            for wall in (room.get("walls") or [])
-            for op in (wall.get("openings") or [])
-            if str(op.get("opening_type", "")).endswith("door")
-        )
-        if door_count == 0 and code not in NO_OPENING_EXEMPT:
-            flags.append("zero_doors_detected:possible_miss")
-            needs_review = True
+        # Rule 6 — REMOVED 2026-09-02, with opening extraction.
+        #
+        # It flagged a habitable room in which no DOOR had been found, which was
+        # a real miss worth a human's time while there was a detector that could
+        # have found one. There is not: this pipeline no longer looks for doors,
+        # so every room has none and the rule could only fire on all of them at
+        # once. A flag that appears on every room on every plan is not a signal,
+        # and its 0.15 confidence penalty would have applied to the whole estate.
+        #
+        # ⚠️ THE CHECK ITSELF STILL MATTERS AND HAS MOVED, not vanished. Ekatan's
+        # verification gate (`lib/fpis/verification-gate.ts`, Rule 4) warns a
+        # reviewer when a sellable room has no openings recorded, and says why:
+        # `computeWallRun` treats a wall with no openings as fully usable, so an
+        # unrecorded doorway becomes storage run a wardrobe is then sized to. It
+        # warns rather than blocks, because zero is now the normal starting state.
 
         # Rule 7 — REMOVED 2026-09-01, for the same reason as Rule 2: it read
         # `room.get("ceiling_height_mm")`, which nothing in this pipeline ever
